@@ -5,8 +5,6 @@
 #include "clear.hpp"
 #include "depth_peek.hpp"
 #include "pipeline_cache.hpp"
-#include "probe.hpp"
-#include "resource_cache.hpp"
 #include "tex_copy_conv.hpp"
 #include "tex_palette_conv.hpp"
 #include "../gx/gx.hpp"
@@ -35,7 +33,6 @@ using webgpu::g_queue;
 namespace {
 constexpr Module Log{"aurora::gfx"};
 PipelineRef g_currentPipeline;
-BindGroupRef g_currentTextureGroup;
 
 void apply_viewport(const wgpu::RenderPassEncoder& pass, const Viewport& vp) {
   const float minDepth = gx::UseReversedZ ? 1.f - vp.zfar : vp.znear;
@@ -122,7 +119,6 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
   // Bind bind group for the whole pass
   pass.SetBindGroup(0, resources().staticBindGroup);
   pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
-  g_currentTextureGroup = 0;
 
   for (auto& cmd : passInfo.commands) {
 #ifdef AURORA_GFX_DEBUG_GROUPS
@@ -167,7 +163,6 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
       g_currentPipeline = UINTPTR_MAX;
       pass.SetBindGroup(0, resources().staticBindGroup);
       pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
-      g_currentTextureGroup = 0;
       if (hasViewport) {
         apply_viewport(pass, currentViewport);
       }
@@ -247,7 +242,7 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
       .colorAttachmentCount = passInfo.colorAttachmentCount,
       .colorAttachments = attachments.data(),
       .depthStencilAttachment = depthStencilAttachmentPtr,
-      .timestampWrites = webgpu::gpu_prof::pass_writes(passIndex == 0 ? "EFB pass (first)" : "EFB pass (later)"),
+      .timestampWrites = webgpu::gpu_prof::pass_writes(label),
   };
 
   auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
@@ -262,9 +257,7 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
   if (passInfo.resolveTarget) {
     const auto& dstSize = passInfo.resolveTarget->size;
     const bool needsConversion = tex_copy_conv::needs_conversion(passInfo.resolveFormat);
-    // A probe face is a layer of a cube texture, which only the blit addresses.
-    const bool needsScaling = passInfo.probeFace >= 0 ||
-                              dstSize.width != static_cast<uint32_t>(passInfo.resolveRect.width) ||
+    const bool needsScaling = dstSize.width != static_cast<uint32_t>(passInfo.resolveRect.width) ||
                               dstSize.height != static_cast<uint32_t>(passInfo.resolveRect.height);
     const bool isDepth = gx::is_depth_format(passInfo.resolveFormat);
     if (isDepth && passInfo.msaaSamples > 1) {
@@ -301,9 +294,6 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
       };
       cmd.CopyTextureToTexture(&src, &dst, &size);
     }
-    if (passInfo.probeFace >= 0) {
-      probe::encode_mips(cmd, passInfo.probeFace, passInfo.probeUniformRange);
-    }
   }
 
   if (passInfo.snapshotColorDst) {
@@ -326,6 +316,12 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
   }
 }
 
+constexpr uint64_t VertexStagingOffset = 0;
+constexpr uint64_t UniformStagingOffset = VertexStagingOffset + VertexBufferSize;
+constexpr uint64_t IndexStagingOffset = UniformStagingOffset + UniformBufferSize;
+constexpr uint64_t StorageStagingOffset = IndexStagingOffset + IndexBufferSize;
+constexpr uint64_t TextureUploadStagingOffset = StorageStagingOffset + StorageBufferSize;
+
 constexpr uint32_t align_down_copy_offset(uint32_t value) noexcept { return value & ~3u; }
 
 void copy_staging_buffer_range(wgpu::CommandEncoder& cmd, const FramePacket& frame, uint32_t& copied,
@@ -343,8 +339,7 @@ void copy_staging_buffer_range(wgpu::CommandEncoder& cmd, const FramePacket& fra
 bool needs_staging_copy(const FramePacket& frame, const FrameOp& op) {
   const auto& highWater = op.highWater;
   if (highWater.verts > frame.copied.verts || highWater.uniforms > frame.copied.uniforms ||
-      highWater.indices > frame.copied.indices || highWater.storage > frame.copied.storage ||
-      op.bufferUploads.size() > frame.copied.bufferUploadCount) {
+      highWater.indices > frame.copied.indices || highWater.storage > frame.copied.storage) {
     return true;
   }
   if constexpr (UseTextureBuffer) {
@@ -360,23 +355,12 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
   const webgpu::gpu_prof::Zone zone{cmd, "Staging copies"};
   const auto& highWater = op.highWater;
   auto& res = resources();
-  const auto& sizes = frame_buffer_sizes();
-  const uint64_t VertexStagingOffset = 0;
-  const uint64_t UniformStagingOffset = VertexStagingOffset + sizes.vertex;
-  const uint64_t IndexStagingOffset = UniformStagingOffset + sizes.uniform;
-  const uint64_t StorageStagingOffset = IndexStagingOffset + sizes.index;
-  const uint64_t TextureUploadStagingOffset = StorageStagingOffset + sizes.storage;
   copy_staging_buffer_range(cmd, frame, frame.copied.verts, highWater.verts, VertexStagingOffset, res.vertexBuffer);
   copy_staging_buffer_range(cmd, frame, frame.copied.uniforms, highWater.uniforms, UniformStagingOffset,
                             res.uniformBuffer);
   copy_staging_buffer_range(cmd, frame, frame.copied.indices, highWater.indices, IndexStagingOffset, res.indexBuffer);
   copy_staging_buffer_range(cmd, frame, frame.copied.storage, highWater.storage, StorageStagingOffset,
                             res.storageBuffer);
-  for (size_t i = frame.copied.bufferUploadCount; i < op.bufferUploads.size(); ++i) {
-    const auto& item = *op.bufferUploads[i];
-    cmd.CopyBufferToBuffer(item.src, 0, item.dst, item.dstOffset, item.size);
-  }
-  frame.copied.bufferUploadCount = op.bufferUploads.size();
 
   if constexpr (UseTextureBuffer) {
     for (size_t i = frame.copied.textureUploadCount; i < op.textureUploads.size(); ++i) {
@@ -434,14 +418,4 @@ bool bind_pipeline(PipelineRef ref, const wgpu::RenderPassEncoder& pass) {
   g_currentPipeline = ref;
   return true;
 }
-
-void bind_texture_group(BindGroupRef ref, const wgpu::RenderPassEncoder& pass) {
-  if (ref == g_currentTextureGroup) {
-    return;
-  }
-  pass.SetBindGroup(2, find_bind_group(ref));
-  g_currentTextureGroup = ref;
-}
-
-void forget_texture_group() { g_currentTextureGroup = 0; }
 } // namespace aurora::gfx

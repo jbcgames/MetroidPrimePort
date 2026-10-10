@@ -73,14 +73,12 @@ typedef int BOOL;
 #if defined(__MWERKS__)
 #define AT_ADDRESS(addr) : (addr)
 #define ATTRIBUTE_ALIGN(num) __attribute__((aligned(num)))
-#elif defined(__GNUC__) || defined(__clang__)
+#elif defined(__GNUC__)
 #define AT_ADDRESS(addr)
 #define ATTRIBUTE_ALIGN(num) __attribute__((aligned(num)))
 #elif defined(_MSC_VER)
 #define AT_ADDRESS(addr)
-// __declspec must precede the declarator, but this macro is used after it
-// (e.g. `bool m_valid ATTRIBUTE_ALIGN(4);`); drop it for MSVC.
-#define ATTRIBUTE_ALIGN(num)
+#define ATTRIBUTE_ALIGN(num) __declspec(align(num))
 #else
 #error unknown compiler
 #endif

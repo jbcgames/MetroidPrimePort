@@ -2,7 +2,6 @@
 #include "__gx.h"
 
 #include "../../gx/fifo.hpp"
-#include "dolphin/gd/GDGeometry.h"
 
 #include <cstring>
 
@@ -10,9 +9,10 @@
 static __GXData_struct sGXData;
 __GXData_struct* __gx = &sGXData;
 static GXFifoObj sFifoObj;
-constexpr u32 kDrawDoneCommand = static_cast<u32>(GX_BP_REG_DRAWDONE) << 24 | 2;
 
 extern "C" {
+static GXDrawDoneCallback DrawDoneCB = nullptr;
+
 GXFifoObj* GXInit(void* base, u32 size) {
   GXRenderModeObj* rmode;
   f32 identity_mtx[3][4];
@@ -29,6 +29,7 @@ GXFifoObj* GXInit(void* base, u32 size) {
   __gx->vNum = 0;
 
   // Initialize FIFO subsystem
+  aurora::gx::fifo::init();
   GXInitFifoBase(&sFifoObj, base, size);
   GXSetCPUFifo(&sFifoObj);
   GXSetGPFifo(&sFifoObj);
@@ -262,38 +263,20 @@ GXFifoObj* GXInit(void* base, u32 size) {
 }
 
 void GXDrawDone() {
-  GXFlush();
-  GX_WRITE_RAS_REG(kDrawDoneCommand);
-  aurora::gx::fifo::drain();
+  if (DrawDoneCB != nullptr)
+    DrawDoneCB();
 }
-
-void GXSetDrawSync(u16 token) {
-  GX_WRITE_AURORA(GX_AURORA_SET_DRAW_SYNC);
-  GX_WRITE_U16(token);
-  if (aurora::gx::fifo::in_display_list()) {
-    return;
-  }
-  // Make the token observable. In a frame the FIFO is published (processed
-  // inline or on the worker depending on mode); outside one nothing is consumed
-  // until the next publish, so force progress to honor callers that spin on the
-  // token during loading.
-  if (aurora::gx::fifo::frame_active() &&
-      aurora::gx::fifo::processing_mode() != aurora::gx::fifo::ProcessingMode::Drain) {
-    aurora::gx::fifo::publish();
-  } else {
-    aurora::gx::fifo::drain();
-  }
-}
-
-u16 GXReadDrawSync(void) { return aurora::gx::draw_sync_token(); }
 
 void GXSetDrawDone() {
-  GXFlush();
-  GX_WRITE_RAS_REG(kDrawDoneCommand);
-  aurora::gx::fifo::publish();
+  if (DrawDoneCB != nullptr)
+    DrawDoneCB();
 }
 
-GXDrawDoneCallback GXSetDrawDoneCallback(GXDrawDoneCallback cb) { return aurora::gx::fifo::set_draw_done_callback(cb); }
+GXDrawDoneCallback GXSetDrawDoneCallback(GXDrawDoneCallback cb) {
+  GXDrawDoneCallback old = DrawDoneCB;
+  DrawDoneCB = cb;
+  return old;
+}
 
 void GXFlush() {
   if (__gx->dirtyState) {
@@ -517,4 +500,9 @@ void __GXSetMatrixIndex(GXAttr matIdxAttr) {
   }
   __gx->bpSent = 0;
 }
+
+static u16 s_drawSyncToken = 0;
+void GXSetDrawSync(u16 token) { s_drawSyncToken = token; }
+u16 GXReadDrawSync(void) { return s_drawSyncToken; }
+void GXWaitDrawDone(void) {}
 };

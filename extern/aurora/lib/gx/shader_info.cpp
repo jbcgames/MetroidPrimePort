@@ -1,26 +1,32 @@
 #include "shader_info.hpp"
 
-#include "../gfx/recording.hpp"
-
+#include <array>
 #include <cmath>
 
+#include "../gfx/hash.hpp"
 #include <tracy/Tracy.hpp>
 
 namespace aurora::gx {
+// TODO: remove, just for testing
+bool enableLodBias = true;
+
 namespace {
-constexpr Module Log{"aurora::gx"};
+Module Log("aurora::gx");
 
 bool is_alpha_bump_channel(GXChannelID id) { return id == GX_ALPHA_BUMP || id == GX_ALPHA_BUMPN; }
 
 Vec4<float> texture_size_bias(const gfx::TextureBind& tex) {
   auto width = static_cast<float>(tex.texObj.width());
   auto height = static_cast<float>(tex.texObj.height());
-  // No viewport-scale bias, which Aurora adds for arbitrary-mip textures to keep the
-  // console's mip choice: on the game's own textures it sampled the wrong mip at
-  // non-integer EFB scales, and on a replacement it reads the console's mip of a texture
-  // up to 32 times larger (a 1024 map over a 32 stub: 4 mips too fine), which shimmers
-  // and cost the phone a third of its frame rate. The GPU's own LOD fits both.
-  return {width, height, tex.texObj.lod_bias(), 0.0f};
+  float vpBias = 0.f;
+  if (enableLodBias && tex.ref && tex.ref->hasArbitraryMips) {
+    const float viewportScale =
+        std::min(g_gxState.renderViewport.width / std::max(g_gxState.logicalViewport.width, 1.f),
+                 g_gxState.renderViewport.height / std::max(g_gxState.logicalViewport.height, 1.f));
+    const float replacementScale = static_cast<float>(tex.ref->size.width) / std::max(width, 1.f);
+    vpBias = std::log2(viewportScale / std::max(replacementScale, 0.001f));
+  }
+  return {width, height, tex.texObj.lod_bias() + vpBias, 0.0f};
 }
 
 void color_arg_reg_info(GXTevColorArg arg, const TevStage& stage, ShaderInfo& info) {
@@ -51,11 +57,10 @@ void color_arg_reg_info(GXTevColorArg arg, const TevStage& stage, ShaderInfo& in
     break;
   case GX_CC_TEXC:
   case GX_CC_TEXA:
-    if (stage.texMapId != GX_TEXMAP_NULL) {
-      CHECK(stage.texCoordId != GX_TEXCOORD_NULL, "tex coord not bound");
-      info.sampledTexCoords.set(stage.texCoordId);
-      info.sampledTextures.set(stage.texMapId);
-    }
+    CHECK(stage.texCoordId != GX_TEXCOORD_NULL, "tex coord not bound");
+    CHECK(stage.texMapId != GX_TEXMAP_NULL, "tex map not bound");
+    info.sampledTexCoords.set(stage.texCoordId);
+    info.sampledTextures.set(stage.texMapId);
     break;
   case GX_CC_RASC:
   case GX_CC_RASA:
@@ -126,11 +131,10 @@ void alpha_arg_reg_info(GXTevAlphaArg arg, const TevStage& stage, ShaderInfo& in
     }
     break;
   case GX_CA_TEXA:
-    if (stage.texMapId != GX_TEXMAP_NULL) {
-      CHECK(stage.texCoordId != GX_TEXCOORD_NULL, "tex coord not bound");
-      info.sampledTexCoords.set(stage.texCoordId);
-      info.sampledTextures.set(stage.texMapId);
-    }
+    CHECK(stage.texCoordId != GX_TEXCOORD_NULL, "tex coord not bound");
+    CHECK(stage.texMapId != GX_TEXMAP_NULL, "tex map not bound");
+    info.sampledTexCoords.set(stage.texCoordId);
+    info.sampledTextures.set(stage.texMapId);
     break;
   case GX_CA_RASA:
     if (stage.channelId != GX_COLOR_NULL && stage.channelId != GX_COLOR_ZERO &&
@@ -172,52 +176,14 @@ void alpha_arg_reg_info(GXTevAlphaArg arg, const TevStage& stage, ShaderInfo& in
     break;
   }
 }
-
-f32 tex_offset(GXTexOffset offs) noexcept {
-  switch (offs) {
-  default:
-  case GX_TO_ZERO:
-    return 0.f;
-  case GX_TO_SIXTEENTH:
-    return 1.f / 16.f;
-  case GX_TO_EIGHTH:
-    return 1.f / 8.f;
-  case GX_TO_FOURTH:
-    return 1.f / 4.f;
-  case GX_TO_HALF:
-    return 1.f / 2.f;
-  case GX_TO_ONE:
-    return 1.f;
-  }
-}
-
-u32 point_texcoord_mask() noexcept {
-  u32 mask = 0;
-  for (int i = 0; i < MaxTexCoord; ++i) {
-    if (g_gxState.texCoordScales[i].pointOffset) {
-      mask |= 1 << i;
-    }
-  }
-  return mask;
-}
-
-u32 line_texcoord_mask() noexcept {
-  u32 mask = 0;
-  for (int i = 0; i < MaxTexCoord; ++i) {
-    if (g_gxState.texCoordScales[i].lineOffset) {
-      mask |= 1 << i;
-    }
-  }
-  return mask;
-}
 } // namespace
 
 ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
   ZoneScoped;
 
   ShaderInfo info{
-      // render/logical viewport size, proj
-      .uniformSize = 8 + 8 + 64,
+      // vtx_start, current_pnmtx, render/logical viewport size, array_start, pad, proj
+      .uniformSize = 4 + 4 + 8 + 8 + 8 + 48 + 64,
   };
 
   if (config.lineMode != 0) {
@@ -234,8 +200,9 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     }
   }
 
-  // 10 position matrices, 10 texture matrices, 10 normal matrices.
-  info.uniformSize += sizeof(Mat3x4<float>) * 30;
+  // 10 position matrices + 10 texture matrices. Normal matrices are added below iff usesNormals.
+  info.uniformSize += sizeof(Mat3x4<float>) * 20;
+  info.uniformSize += 16; // active PN matrix index + padding
 
   for (int i = 0; i < config.tevStageCount; ++i) {
     const auto& stage = config.tevStages[i];
@@ -314,6 +281,13 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
       }
     }
   }
+  // Normal matrices (nrm_mtx) are read only by lit shaders (lighting_func, per-pixel normal
+  // output, emboss bump) and the normal-visualization debug path. Unlit draws never reference
+  // them, so gate the 480B palette here (lightingEnabled is fully resolved by this point).
+  info.usesNormals = info.lightingEnabled || EnableNormalVisualization;
+  if (info.usesNormals) {
+    info.uniformSize += sizeof(Mat3x4<float>) * MaxPnMtx;
+  }
   if (info.lightingEnabled) {
     // Lights + light state for all channels
     info.uniformSize += 16 + sizeof(Light) * GX::MaxLights;
@@ -347,50 +321,100 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
       info.usesPTTexMtx.set(postMtxIdx);
     }
   }
-  if (config.pbr) {
-    info.usesPbr = true;
-    info.usesLightmap = config.pbrLightmapAttr != GX_VA_NULL;
-    // 7 single + ambient 6 + volume 6 + tone 3 + backlight 3 + light skip + light scale, then the linear light
-    // colours, then 3 HDR rows per light
-    info.uniformSize += sizeof(Mat3x4<float>) + sizeof(Vec4<float>) * (31 + GX::MaxLights * 4);
-  }
-  if (info.usesPTTexMtx.any()) {
+  if (info.usesPTTexMtx.any())
     info.uniformSize += sizeof(Mat3x4<float>) * MaxPTTexMtx;
-  }
   if (config.fogType != GX_FOG_NONE) {
     info.usesFog = true;
     info.uniformSize += sizeof(Fog);
-  }
-  if (config.volFog != VolFogNone) {
-    info.usesVolFog = true;
-    // near, range, exposure; the tone curve
-    info.uniformSize += sizeof(Vec4<float>) * 4;
   }
   info.uniformSize += MaxTexCoord * sizeof(Vec4<float>);
   if (info.usedIndTexMtxs.any()) {
     info.uniformSize += MaxIndTexMtxs * sizeof(Mat2x4<float>);
   }
   info.uniformSize += info.sampledTextures.count() * sizeof(Vec4<float>);
-  if (config.shadow) {
-    info.usesShadow = true;
-    info.shadowReceive = shadow_receives(config);
-    // The caster and receiver matrices, the sun's direction and colour (GXState::shadowUniform)
-    info.uniformSize += sizeof(g_gxState.shadowUniform);
-  }
   info.uniformSize = gfx::align_uniform(info.uniformSize);
   if (info.uniformSize > MaxUniformSize) {
     Log.fatal("Uniform size exceeds maximum: {} > {}", info.uniformSize, MaxUniformSize);
   }
+  info.id = xxh3_hash_s(&info, offsetof(ShaderInfo, id));
   return info;
 }
 
-static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
+static f32 tex_offset(GXTexOffset offs) noexcept {
+  switch (offs) {
+    DEFAULT_FATAL("invalid tex offset {}", underlying(offs));
+  case GX_TO_ZERO:
+    return 0.f;
+  case GX_TO_SIXTEENTH:
+    return 1.f / 16.f;
+  case GX_TO_EIGHTH:
+    return 1.f / 8.f;
+  case GX_TO_FOURTH:
+    return 1.f / 4.f;
+  case GX_TO_HALF:
+    return 1.f / 2.f;
+  case GX_TO_ONE:
+    return 1.f;
+  }
+}
+
+static u32 point_texcoord_mask() noexcept {
+  u32 mask = 0;
+  for (int i = 0; i < MaxTexCoord; ++i) {
+    if (g_gxState.texCoordScales[i].pointOffset) {
+      mask |= 1 << i;
+    }
+  }
+  return mask;
+}
+
+static u32 line_texcoord_mask() noexcept {
+  u32 mask = 0;
+  for (int i = 0; i < MaxTexCoord; ++i) {
+    if (g_gxState.texCoordScales[i].lineOffset) {
+      mask |= 1 << i;
+    }
+  }
+  return mask;
+}
+
+gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRanges& ranges) noexcept {
+  ZoneScoped;
+
+  struct FastUniformCache {
+    uint32_t frame = UINT32_MAX;
+    uint64_t uniformVersion = 0;
+    uint64_t shaderId = 0;
+    gfx::Range range{};
+  };
+  static constexpr size_t kFastCacheSlots = 512;
+  static std::array<FastUniformCache, kFastCacheSlots> s_fastCache;
+
+  const uint32_t curFrame = gfx::current_frame();
+  const uint64_t cacheKey = (g_gxState.uniformVersion * 0x9e3779b97f4a7c15ULL) ^ info.id;
+  const size_t fastSlot = static_cast<size_t>(cacheKey & (kFastCacheSlots - 1));
+  auto& fastEntry = s_fastCache[fastSlot];
+  if (fastEntry.frame == curFrame &&
+      fastEntry.uniformVersion == g_gxState.uniformVersion &&
+      fastEntry.shaderId == info.id &&
+      vtxStart == 0) {
+    return fastEntry.range;
+  }
+
+  static ByteBuffer buf;
+  buf.clear();
   buf.reserve_extra(info.uniformSize);
 
+  buf.append(vtxStart);
+  buf.append(g_gxState.currentPnMtx);
   buf.append<f32>(g_gxState.renderViewport.width);
   buf.append<f32>(g_gxState.renderViewport.height);
   buf.append<f32>(g_gxState.logicalViewport.width);
   buf.append<f32>(g_gxState.logicalViewport.height);
+  buf.append_zeroes(8); // pad
+  for (const auto& vaRange : ranges.vaRanges) {
+    buf.append<u32>(vaRange.offset);
+  }
   if (info.lineMode != 0) {
     if (info.lineMode == 3) { // GX_POINTS
       buf.append<f32>(static_cast<f32>(g_gxState.pointSize) / 6.f);
@@ -404,13 +428,7 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
       buf.append<u32>(line_texcoord_mask());
     }
   }
-  auto proj = g_gxState.proj;
-  if constexpr (UseReversedZ) {
-    proj.m2 = proj.m2 * Vec4{-1.f, -1.f, -1.f, -1.f};
-  } else {
-    proj.m2 = proj.m2 + proj.m3;
-  }
-  buf.append(proj);
+  buf.append(g_gxState.proj);
 
   for (int i = 0; i < MaxPnMtx; i++) {
     buf.append(g_gxState.pnMtx[i].pos);
@@ -420,8 +438,10 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
     buf.append(g_gxState.texMtxs[i]);
   }
 
-  for (int i = 0; i < MaxPnMtx; i++) {
-    buf.append(g_gxState.pnMtx[i].nrm);
+  if (info.usesNormals) {
+    for (int i = 0; i < MaxPnMtx; i++) {
+      buf.append(g_gxState.pnMtx[i].nrm);
+    }
   }
 
   for (int i = 0; i < info.loadsTevReg.size(); ++i) {
@@ -464,53 +484,6 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
       buf.append(g_gxState.kcolors[i]);
     }
   }
-  if (info.usesPbr) {
-    buf.append(g_gxState.pbrProbe);
-    buf.append(g_gxState.pbrEmissive);
-    buf.append(g_gxState.pbrBacklight);
-    buf.append(g_gxState.pbrLayer);
-    buf.append(g_gxState.pbrLayerHeight);
-    buf.append(g_gxState.pbrParam);
-    buf.append(g_gxState.pbrUp);
-    buf.append(g_gxState.pbrCubeParams);
-    for (const auto& v : g_gxState.pbrAmbient) {
-      buf.append(v);
-    }
-    for (const auto& v : g_gxState.pbrVolumeRows) {
-      buf.append(v);
-    }
-    for (const auto& v : g_gxState.pbrTone) {
-      buf.append(v);
-    }
-    for (const auto& v : g_gxState.pbrBacklightLights) {
-      buf.append(v);
-    }
-    // yzw carry the baked-light modulation.
-    Vec4<float> lightSkip = g_gxState.pbrLightSkip;
-    lightSkip.y() = g_gxState.pbrBakedLightModulation.x();
-    lightSkip.z() = g_gxState.pbrBakedLightModulation.y();
-    lightSkip.w() = g_gxState.pbrBakedLightModulation.z();
-    buf.append(lightSkip);
-    // z says whether the environment BRDF table is in use.
-    Vec4<float> lightScale = g_gxState.pbrLightScale;
-    lightScale.z() = g_gxState.pbrBrdfLut ? 1.f : 0.f;
-    buf.append(lightScale);
-    // The lights' colours made linear here once, not per light in every pixel.
-    for (const auto& light : g_gxState.lights) {
-      const auto linear = [](float c) { return std::pow(std::max(c, 0.f), 2.2f); };
-      buf.append(Vec4<float>{linear(light.color.x()), linear(light.color.y()), linear(light.color.z()), 0.f});
-    }
-    for (const auto& v : g_gxState.pbrLightHdr) {
-      buf.append(v);
-    }
-    for (const auto& v : g_gxState.pbrShield) {
-      buf.append(v);
-    }
-    buf.append(g_gxState.pbrLightmapRect);
-    for (const auto& v : g_gxState.pbrLightmapAxes) {
-      buf.append(v);
-    }
-  }
   if (info.usesPTTexMtx.any()) {
     for (int i = 0; i < info.usesPTTexMtx.size(); ++i) {
       buf.append(g_gxState.ptTexMtxs[i]);
@@ -518,35 +491,15 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
   }
   if (info.usesFog) {
     const auto& state = g_gxState.fog;
-    const float logicalWidth = std::max(g_gxState.logicalViewport.width, 1.f);
-    const float renderWidth = std::max(g_gxState.renderViewport.width, 1.f);
-    Fog fog{
-        .color = state.color,
-        .a = state.a,
-        .b = state.b,
-        .c = state.c,
-        .rangeCenter = ((static_cast<float>(state.rangeCenter) - g_gxState.logicalViewport.left) / logicalWidth) * 2.f -
-                       1.f + (g_gxState.renderViewport.left / renderWidth) * 2.f,
-    };
-    for (u32 i = 0; i < state.rangeK.size(); ++i) {
-      const u32 source = (i & ~1u) | (1u - (i & 1u));
-      fog.rangeK[i / 4][i % 4] = static_cast<float>(state.rangeK[source]) / 64.f;
-    }
-    fog.rangeK[2][2] = fog.rangeK[2][1];
-    fog.rangeK[2][3] = fog.rangeK[2][1];
+    Fog fog{.color = state.color, .a = state.a, .b = state.b, .c = state.c};
     buf.append(fog);
   }
-  if (info.usesVolFog) {
-    buf.append(g_gxState.volFogParams);
-    for (const auto& v : g_gxState.volFogTone) {
-      buf.append(v);
-    }
-  }
   for (const auto& scale : g_gxState.texCoordScales) {
-    buf.append(Vec4{static_cast<f32>(scale.scaleS) + 1.0f, static_cast<f32>(scale.scaleT) + 1.0f, 0.0f, 0.0f});
+    buf.append(
+        Vec4{static_cast<f32>(scale.scaleS) + 1.0f, static_cast<f32>(scale.scaleT) + 1.0f, 0.0f, 0.0f});
   }
   if (info.usedIndTexMtxs.any()) {
-    for (u32 i = 0; i < MaxIndTexMtxs; ++i) {
+    for (int i = 0; i < MaxIndTexMtxs; ++i) {
       const auto& mtx = g_gxState.indTexMtxs[i];
       buf.append(Vec4{mtx.mtx.m0.x, mtx.mtx.m0.y, mtx.mtx.m1.x, mtx.mtx.m1.y});
       buf.append(Vec4{mtx.mtx.m2.x, mtx.mtx.m2.y, std::exp2f(mtx.scaleExp), 0.0f});
@@ -556,20 +509,65 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
     if (!info.sampledTextures.test(i)) {
       continue;
     }
-    buf.append(texture_size_bias(get_texture(static_cast<GXTexMapID>(i))));
+    const auto& tex = get_texture(static_cast<GXTexMapID>(i));
+    // CHECK(tex, "unbound texture {}", i);
+    buf.append(texture_size_bias(tex));
   }
-  if (info.usesShadow) {
-    for (const auto& v : g_gxState.shadowUniform) {
-      buf.append(v);
-    }
-  }
-}
+  g_gxState.stateDirty = false;
 
-gfx::Range build_uniform(const ShaderInfo& info) noexcept {
-  ZoneScoped;
-  static ByteBuffer buf;
-  buf.clear();
-  fill_uniform(buf, info);
-  return gfx::push_uniform(buf.data(), buf.size());
+  struct FrameUniformEntry {
+    uint32_t frame = UINT32_MAX;
+    uint64_t hash = 0;
+    gfx::Range range{};
+    ByteBuffer data;
+  };
+  static constexpr size_t kUniformCacheSlots = 512;
+  static std::array<FrameUniformEntry, kUniformCacheSlots> s_uniformCache;
+  static gfx::Range s_lastUniformRange{};
+  static uint32_t s_lastUniformFrame = UINT32_MAX;
+  static uint64_t s_lastUniformHash = 0;
+
+  const uint64_t hash = xxh3_hash_s(buf.data(), buf.size(), 0);
+
+  // Fast path: adjacent draw with identical uniforms
+  if (curFrame == s_lastUniformFrame && s_lastUniformHash == hash && s_lastUniformRange.size == buf.size()) {
+    fastEntry.frame = curFrame;
+    fastEntry.uniformVersion = g_gxState.uniformVersion;
+    fastEntry.shaderId = info.id;
+    fastEntry.range = s_lastUniformRange;
+    return s_lastUniformRange;
+  }
+
+  // Slot lookup for recurring uniform states in the same frame
+  const size_t slot = static_cast<size_t>(hash & (kUniformCacheSlots - 1));
+  auto& entry = s_uniformCache[slot];
+  if (entry.frame == curFrame && entry.hash == hash && entry.range.size == buf.size() &&
+      entry.data.size() == buf.size() && std::memcmp(entry.data.data(), buf.data(), buf.size()) == 0) {
+    s_lastUniformFrame = curFrame;
+    s_lastUniformHash = hash;
+    s_lastUniformRange = entry.range;
+    fastEntry.frame = curFrame;
+    fastEntry.uniformVersion = g_gxState.uniformVersion;
+    fastEntry.shaderId = info.id;
+    fastEntry.range = entry.range;
+    return entry.range;
+  }
+
+  // Miss: allocate in GPU uniform ring and store in cache
+  const gfx::Range range = gfx::push_uniform(buf.data(), buf.size());
+  entry.frame = curFrame;
+  entry.hash = hash;
+  entry.range = range;
+  entry.data.clear();
+  entry.data.append(buf.data(), buf.size());
+
+  s_lastUniformFrame = curFrame;
+  s_lastUniformHash = hash;
+  s_lastUniformRange = range;
+  fastEntry.frame = curFrame;
+  fastEntry.uniformVersion = g_gxState.uniformVersion;
+  fastEntry.shaderId = info.id;
+  fastEntry.range = range;
+  return range;
 }
 } // namespace aurora::gx

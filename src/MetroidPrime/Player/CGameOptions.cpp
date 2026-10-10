@@ -16,6 +16,7 @@
 #ifdef TARGET_PC
 #include "port_apclient.h"
 #include "port_randomizer.h"
+#include "port_debug.h"
 #endif
 
 const bool CGameOptions::skDefaultHudLag = true;
@@ -51,8 +52,8 @@ CGameOptions::CGameOptions()
 , x4c_screenXOffset(0)
 , x50_screenYOffset(0)
 , x54_screenStretch(0)
-, x58_sfxVol(0x7f)
-, x5c_musicVol(0x7f)
+, x58_sfxVol(0x5a)
+, x5c_musicVol(0x5a)
 , x60_hudAlpha(0xff)
 , x64_helmetAlpha(0xff)
 , x68_24_hudLag(skDefaultHudLag)
@@ -70,8 +71,8 @@ CGameOptions::CGameOptions(CInputStream& in)
 , x4c_screenXOffset(0)
 , x50_screenYOffset(0)
 , x54_screenStretch(0)
-, x58_sfxVol(0x7f)
-, x5c_musicVol(0x7f)
+, x58_sfxVol(0x5a)
+, x5c_musicVol(0x5a)
 , x60_hudAlpha(0xff)
 , x64_helmetAlpha(0xff)
 , x68_24_hudLag(skDefaultHudLag)
@@ -90,6 +91,14 @@ CGameOptions::CGameOptions(CInputStream& in)
   x54_screenStretch = in.ReadBits(CalculateBits(0x14)) - 10;
   x58_sfxVol = in.ReadBits(CalculateBits(0x7f));
   x5c_musicVol = in.ReadBits(CalculateBits(0x7f));
+#ifdef TARGET_PC
+  if (PortDebug::HasSfxVolume()) {
+    x58_sfxVol = (PortDebug::SfxVolume() * 127 + 50) / 100;
+  }
+  if (PortDebug::HasMusicVolume()) {
+    x5c_musicVol = (PortDebug::MusicVolume() * 127 + 50) / 100;
+  }
+#endif
   x60_hudAlpha = in.ReadBits(CalculateBits(0xff));
   x64_helmetAlpha = in.ReadBits(CalculateBits(0xff));
 
@@ -129,8 +138,13 @@ void CGameOptions::ResetToDefaults() {
   x4c_screenXOffset = 0;
   x50_screenYOffset = 0;
   x54_screenStretch = 0;
-  x58_sfxVol = 0x7f;
-  x5c_musicVol = 0x7f;
+#ifdef TARGET_PC
+  x58_sfxVol = PortDebug::HasSfxVolume() ? (PortDebug::SfxVolume() * 127 + 50) / 100 : 0x5a;
+  x5c_musicVol = PortDebug::HasMusicVolume() ? (PortDebug::MusicVolume() * 127 + 50) / 100 : 0x5a;
+#else
+  x58_sfxVol = 0x5a;
+  x5c_musicVol = 0x5a;
+#endif
   x44_soundMode = CAudioSys::kSM_Stereo;
   x60_hudAlpha = 0xff;
   x64_helmetAlpha = 0xff;
@@ -148,6 +162,14 @@ void CGameOptions::EnsureOptions() {
   SetScreenPositionX(x4c_screenXOffset, true);
   SetScreenPositionY(x50_screenYOffset, true);
   SetScreenStretch(x54_screenStretch, true);
+#ifdef TARGET_PC
+  if (PortDebug::HasSfxVolume()) {
+    x58_sfxVol = (PortDebug::SfxVolume() * 127 + 50) / 100;
+  }
+  if (PortDebug::HasMusicVolume()) {
+    x5c_musicVol = (PortDebug::MusicVolume() * 127 + 50) / 100;
+  }
+#endif
   SetSfxVolume(x58_sfxVol, true);
   SetMusicVolume(x5c_musicVol, true);
   SetSurroundMode(CAudioSys::ESurroundModes(x44_soundMode), true);

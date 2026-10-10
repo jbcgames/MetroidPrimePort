@@ -15,17 +15,10 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <list>
 #include <optional>
 #include <utility>
-
-#if defined(__linux__) || defined(__ANDROID__)
-#include <sys/mman.h>
-#include <unistd.h>
-#endif
 
 namespace aurora::gx {
 namespace {
@@ -154,6 +147,11 @@ void do_clear_static_texture_cache() noexcept {
 }
 
 void apply_pending_invalidations() noexcept {
+  // Plain loads first: this runs several times per draw, and an exchange is a locked write.
+  if (s_pendingCacheClears.load(std::memory_order_acquire) == 0 &&
+      s_pendingInvalidations.load(std::memory_order_acquire) == 0) {
+    return;
+  }
   const uint64_t pendingCacheClears = s_pendingCacheClears.exchange(0, std::memory_order_acq_rel);
   const uint64_t pendingInvalidations = s_pendingInvalidations.exchange(0, std::memory_order_acq_rel);
   if (pendingCacheClears != 0) {
@@ -284,57 +282,6 @@ struct TextureKeys {
   TextureContentKey contentKey;
   std::optional<aurora::texture::TextureSourceKey> sourceKey;
 };
-
-// The game can bind a texture whose backing store has already been released,
-// for example a dumped bitmap reloaded after its area was evicted. The console
-// reads whatever is in MEM1; natively that can be an unmapped page, and hashing
-// it faults in the FIFO worker. Skip the source instead of crashing and log the
-// pointer so the offending texture can be identified (MP_LOG_TEX_INVALID=1).
-bool texture_source_is_mapped(const GXTexObj_& obj) noexcept {
-#if defined(__linux__) || defined(__ANDROID__)
-  const long pageSize = sysconf(_SC_PAGESIZE);
-  if (pageSize <= 0) {
-    return true;
-  }
-  const uintptr_t addr = reinterpret_cast<uintptr_t>(obj.data);
-  const uintptr_t page = addr & ~static_cast<uintptr_t>(pageSize - 1);
-  unsigned char resident = 0;
-  return mincore(reinterpret_cast<void*>(page), 1, &resident) == 0;
-#else
-  return true;
-#endif
-}
-
-// The EFB copy registered for obj's data pointer, if obj samples it. Games free
-// copy destinations without calling GXDestroyCopyTex, so a registration can
-// outlive its buffer; a texture later loaded at the same heap address would then
-// sample the stale copy (blank or garbled text, icons). A real copy target is
-// sampled at the size it was copied at, so a size mismatch means the address has
-// been reused for unrelated texture data.
-const GXState::CopyTextureRef* find_copy_texture(const GXTexObj_& obj) noexcept {
-  const auto it = g_gxState.copyTextures.find(obj.data);
-  if (it == g_gxState.copyTextures.end()) {
-    return nullptr;
-  }
-  if (obj.width() != it->second.width || obj.height() != it->second.height) {
-    return nullptr;
-  }
-  return &it->second;
-}
-
-void log_invalid_texture_source(const GXTexObj_& obj, const char* where) noexcept {
-  static const bool enabled = std::getenv("MP_LOG_TEX_INVALID") != nullptr;
-  if (!enabled) {
-    return;
-  }
-  const auto copyIt = g_gxState.copyTextures.find(obj.data);
-  std::fprintf(stderr,
-               "[tex] %s: unmapped data=%p userData=%p rawfmt=%u fmt=%u %ux%u mips=%u id=%u "
-               "image0=%08X image3=%08X mode0=%08X flags=%02X copyTex=%d\n",
-               where, obj.data, obj.userData, obj.raw_format(), obj.format(), obj.width(),
-               obj.height(), obj.mip_count(), obj.texObjId, obj.image0, obj.image3, obj.mode0,
-               obj.flags, copyIt != g_gxState.copyTextures.end() ? 1 : 0);
-}
 
 TextureKeys hash_texture_source(const GXTexObj_& obj, const GXTlutObj_* tlut, bool buildSourceKey) {
   ZoneScoped;
@@ -509,14 +456,14 @@ void touch_bound_texture(const GXTexObj_& obj) {
   if (!is_palette_format(obj.format()) || obj.tlut >= g_gxState.loadedTluts.size()) {
     return;
   }
-  const auto* copyRef = find_copy_texture(obj);
-  if (copyRef == nullptr) {
+  const auto copyIt = g_gxState.copyTextures.find(obj.data);
+  if (copyIt == g_gxState.copyTextures.end()) {
     return;
   }
   const auto& tlut = g_gxState.loadedTluts[obj.tlut];
   if (auto tlutIt = s_tlutObjectCaches.find(tlut.tlutObjId); tlutIt != s_tlutObjectCaches.end()) {
     tlutIt->second.lastUsedFrame = s_frameCount;
-    if (auto dynamicIt = tlutIt->second.dynamicPaletteTextures.find(make_dynamic_palette_key(obj, *copyRef));
+    if (auto dynamicIt = tlutIt->second.dynamicPaletteTextures.find(make_dynamic_palette_key(obj, copyIt->second));
         dynamicIt != tlutIt->second.dynamicPaletteTextures.end()) {
       dynamicIt->second.lastUsedFrame = s_frameCount;
     }
@@ -653,12 +600,6 @@ void invalidate_replacement(uint64_t replacementId) noexcept {
 gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
   ZoneScoped;
 
-  // A texture whose bitmap data has not been uploaded (or was unloaded) has no
-  // valid source; hashing/uploading it would read invalid memory.
-  if (!obj.has_data()) {
-    return {};
-  }
-
   if (obj.texObjId != 0) {
     if (const auto it = s_textureObjectCaches.find(obj.texObjId); it != s_textureObjectCaches.end()) {
       auto& entry = it->second;
@@ -668,13 +609,6 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
         return entry.handle;
       }
     }
-  }
-
-  // Only a source that is about to be read needs the check: it is a system call, and a cached
-  // texture is drawn without touching its source.
-  if (!texture_source_is_mapped(obj)) {
-    log_invalid_texture_source(obj, "resolve_static_texture");
-    return {};
   }
 
   gfx::TextureHandle handle;
@@ -716,10 +650,6 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
 gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GXTlutObj_& tlut) {
   ZoneScoped;
 
-  if (!obj.has_data()) {
-    return {};
-  }
-
   if (obj.texObjId != 0) {
     if (const auto it = s_textureObjectCaches.find(obj.texObjId); it != s_textureObjectCaches.end()) {
       auto& entry = it->second;
@@ -733,13 +663,6 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
         return entry.handle;
       }
     }
-  }
-
-  // Only a source that is about to be read needs the check: it is a system call, and a cached
-  // texture is drawn without touching its source.
-  if (!texture_source_is_mapped(obj)) {
-    log_invalid_texture_source(obj, "resolve_static_palette_texture");
-    return {};
   }
 
   gfx::TextureHandle handle;
@@ -782,7 +705,6 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
 
 void end_frame() noexcept {
   const auto streamingStats = gfx::texture_replacement::process_streaming();
-  gfx::texture_replacement::sweep_idle_cache();
   s_stats.pendingLoads = streamingStats.pendingLoads;
   s_stats.publishes = streamingStats.publishes;
   s_stats.publishBytes = streamingStats.publishBytes;
@@ -881,37 +803,11 @@ void clear_copy_texture_cache() noexcept {
   texture::invalidate_bindings();
 }
 
-void trim_copy_texture_cache() noexcept {
-  // A resize keeps the latest copy at each address: the copies are standalone
-  // textures, and a paused game keeps sampling one it took before the resize
-  // (Metroid Prime's pause backdrop), which a full clear turned black. Pooled
-  // copies nothing points to are freed, as they would mostly be at the old size.
-  absl::flat_hash_set<const void*> live;
-  for (const auto& [_, ref] : g_gxState.copyTextures) {
-    if (ref.handle) {
-      live.insert(ref.handle.get());
-    }
-  }
-  for (auto it = g_gxState.copyTextureCache.begin(); it != g_gxState.copyTextureCache.end();) {
-    if (!it->second.handle || !live.contains(it->second.handle.get())) {
-      g_gxState.copyTextureCache.erase(it++);
-    } else {
-      ++it;
-    }
-  }
-  for (auto& [_, cache] : s_tlutObjectCaches) {
-    cache.dynamicPaletteTextures.clear();
-  }
-  texture::invalidate_bindings();
-}
-
 void clear_static_texture_cache() noexcept { s_pendingCacheClears.fetch_add(1, std::memory_order_release); }
 
 void evict_copy_texture(const void* dest) noexcept {
   absl::flat_hash_set<const void*> sourceIdentities;
-  bool erased = false;
   if (const auto it = g_gxState.copyTextures.find(dest); it != g_gxState.copyTextures.end()) {
-    erased = true;
     if (it->second.handle) {
       sourceIdentities.insert(it->second.handle.get());
     }
@@ -920,7 +816,6 @@ void evict_copy_texture(const void* dest) noexcept {
 
   for (auto it = g_gxState.copyTextureCache.begin(); it != g_gxState.copyTextureCache.end();) {
     if (it->first.dest == dest) {
-      erased = true;
       if (it->second.handle) {
         sourceIdentities.insert(it->second.handle.get());
       }
@@ -941,55 +836,7 @@ void evict_copy_texture(const void* dest) noexcept {
       }
     }
   }
-  // CTexture calls this for every texture it loads, almost always with nothing
-  // registered; keep those calls from dropping the bound textures.
-  if (erased) {
-    texture::invalidate_bindings();
-  }
-}
-
-// The copy pool is keyed by dest and size, and a dest copied at a size that follows the
-// screen (Metroid Prime's fog volumes copy a chunk the size of the volume's projected box
-// into two fixed buffers) gets a new texture for every size it reaches, none ever freed: on
-// a phone, where GPU memory is RAM, a walk round Magmoor grew past a gigabyte. Keep the
-// `keep` sizes written most recently for dest and free the rest.
-void trim_copy_sizes(const void* dest, size_t keep) noexcept {
-  size_t count = 0;
-  for (const auto& [key, _] : g_gxState.copyTextureCache) {
-    count += key.dest == dest;
-  }
-  if (count <= keep) {
-    return;
-  }
-  const auto current = g_gxState.copyTextures.find(dest);
-  const void* currentIdentity =
-      current != g_gxState.copyTextures.end() && current->second.handle ? current->second.handle.get() : nullptr;
-  absl::flat_hash_set<const void*> sourceIdentities;
-  for (; count > keep; --count) {
-    auto oldest = g_gxState.copyTextureCache.end();
-    for (auto it = g_gxState.copyTextureCache.begin(); it != g_gxState.copyTextureCache.end(); ++it) {
-      if (it->first.dest == dest && it->second.handle.get() != currentIdentity &&
-          (oldest == g_gxState.copyTextureCache.end() || it->second.lastCopy < oldest->second.lastCopy)) {
-        oldest = it;
-      }
-    }
-    if (oldest == g_gxState.copyTextureCache.end()) {
-      break;
-    }
-    if (oldest->second.handle) {
-      sourceIdentities.insert(oldest->second.handle.get());
-    }
-    g_gxState.copyTextureCache.erase(oldest);
-  }
-  for (auto& [_, cache] : s_tlutObjectCaches) {
-    for (auto it = cache.dynamicPaletteTextures.begin(); it != cache.dynamicPaletteTextures.end();) {
-      if (sourceIdentities.contains(it->first.sourceIdentity)) {
-        cache.dynamicPaletteTextures.erase(it++);
-      } else {
-        ++it;
-      }
-    }
-  }
+  texture::invalidate_bindings();
 }
 
 void resolve_sampled_textures(const ShaderInfo& info) noexcept {
@@ -1010,7 +857,8 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
     }
 
     gfx::TextureHandle handle;
-    const GXState::CopyTextureRef* copyRef = find_copy_texture(obj);
+    const auto copyIt = g_gxState.copyTextures.find(obj.data);
+    const GXState::CopyTextureRef* copyRef = copyIt != g_gxState.copyTextures.end() ? &copyIt->second : nullptr;
     if (is_palette_format(obj.format())) {
       const auto tlutIdx = static_cast<size_t>(obj.tlut);
       if (tlutIdx < g_gxState.loadedTluts.size()) {

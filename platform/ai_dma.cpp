@@ -71,8 +71,11 @@ void EnsureStream() {
   if (sStream == nullptr) {
     std::fprintf(stderr, "AI audio device unavailable: %s\n", SDL_GetError());
     sOutputEnabled = false;
-  } else if (sPlaying) {
-    SDL_ResumeAudioStreamDevice(sStream);
+  } else {
+    SDL_SetAudioStreamGain(sStream, 0.75f);
+    if (sPlaying) {
+      SDL_ResumeAudioStreamDevice(sStream);
+    }
   }
 }
 

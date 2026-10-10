@@ -1,6 +1,6 @@
 #pragma once
 
-#include "types.hpp"
+#include "common.hpp"
 
 #include <functional>
 
@@ -18,24 +18,20 @@ struct PipelineConfig;
 
 namespace aurora::gfx {
 
-enum class ShaderType : uint8_t {
-  Clear = 0,
-  GX = 1,
-  Rml = 2,
-};
-
-using NewPipelineCallback = std::function<wgpu::RenderPipeline()>;
+using NewPipelineCallback = std::function<gl::Pipeline()>;
 
 void initialize_pipeline_cache();
 void shutdown_pipeline_cache();
 void begin_pipeline_frame();
-// Forgets every built and queued pipeline; the next lookup rebuilds them (shader reload).
-void drop_pipelines();
 void end_pipeline_frame();
 
 template <typename Config>
 PipelineRef find_pipeline(ShaderType type, const Config& config, NewPipelineCallback&& cb);
 
-bool get_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline);
+bool get_pipeline(PipelineRef ref, gl::Pipeline& pipeline);
+
+// Draw thread: whether `ref`, returned by an earlier find_pipeline, is still built or queued (a
+// queued background build moves up, as a lookup would).
+bool touch_pipeline(PipelineRef ref);
 
 } // namespace aurora::gfx

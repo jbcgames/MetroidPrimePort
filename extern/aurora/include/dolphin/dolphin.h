@@ -20,6 +20,5 @@
 // #include <dolphin/demo.h>
 #include <dolphin/exi.h>
 #include <dolphin/si.h>
-#include <dolphin/thp.h>
 
 #endif

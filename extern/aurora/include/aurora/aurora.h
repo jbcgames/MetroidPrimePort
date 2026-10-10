@@ -117,34 +117,23 @@ typedef struct {
    */
   uint32_t mem2Size;
 
-  /*
-   * Multiplies what one frame can hold of vertex, index and array data (5, 2 and 8 MiB at 1),
-   * and doubles the 24 MiB of uniforms when above 1. 0 means 1. A frame that outgrows
-   * its buffers aborts, so raise this for content denser than the original game's.
-   */
-  uint32_t frameBufferScale;
-
-  /*
-   * MiB of the shared vertex, index and array buffers set aside for data kept across frames
-   * (GXPortRetainResident), on top of what a frame holds. 0 sets none aside; the device's
-   * limits may allow less.
-   */
+  float frameBufferScale;
   uint32_t residentGeometryMiB;
-
-  /*
-   * An initial pipeline cache database held in memory (must stay valid for the whole run). When set
-   * it is used instead of <resourcesPath>/initial_pipeline_cache.db, so a stale file left beside the
-   * application cannot override it.
-   */
-  const uint8_t* pipelineCacheSeedData;
+  const void* pipelineCacheSeedData;
   size_t pipelineCacheSeedSize;
-
-  /*
-   * A directory (with a trailing slash) Dawn searches first for the Vulkan library, e.g. a shim
-   * for a custom driver. Null searches the usual places only.
-   */
   const char* vulkanLibraryDir;
 } AuroraConfig;
+
+typedef struct {
+  uint32_t count[2];
+  uint64_t bytes[2];
+} AuroraTextureStats;
+
+typedef struct {
+  const char* name;
+  float msPerFrame;
+  float passesPerFrame;
+} GXPortGpuTime;
 
 typedef struct {
   AuroraBackend backend;
@@ -159,47 +148,84 @@ void aurora_shutdown();
 const AuroraEvent* aurora_update();
 bool aurora_begin_frame();
 void aurora_end_frame();
-// Drops the swapchain if the window's surface went away, without starting a frame.
-// For a main thread that waits outside the frame loop (a file dialog, a long copy):
-// Android's surfaceDestroyed waits for this, and a swapchain left on a destroyed
-// window can lose the device. Cheap when nothing changed.
-void aurora_release_lost_surface();
-// True while the app is backgrounded or has no surface (Android pause): the main loop
-// may legitimately not run then. Atomics only, so any thread can ask.
-bool aurora_is_suspended();
 
 void aurora_set_log_level(AuroraLogLevel level);
 void aurora_set_pause_on_focus_lost(bool value);
 void aurora_set_background_input(bool value);
 void aurora_set_resampler(AuroraSampler sampler);
-/** Sets MSAA samples (1 or 4) and max texture anisotropy (1-16); applied at the next frame start. */
-void aurora_set_graphics_quality(uint32_t msaa, uint16_t maxTextureAnisotropy);
 /** Sets the clock timescale. Default 1.0f. 0.0f is paused. Range 0.0f-16.0f. */
 void aurora_set_timescale(float scale);
 
 AuroraBackend aurora_get_backend();
-// The driver's description from the graphics adapter (e.g. "Turnip Mesa driver 25.1.0"); "" before init.
-const char* aurora_get_gpu_driver();
-// True when AuroraConfig::vulkanLibraryDir's Vulkan library failed and the system's was tried instead.
-bool aurora_vulkan_library_failed();
 const AuroraBackend* aurora_get_available_backends(size_t* count);
 float aurora_get_timescale();
 
-/**
- * GPU self-test: renders known patterns offscreen through the game's GX path, reads them back and logs
- * "gpu selftest: <case>: PASS/FAIL" lines. Call inside a frame (after aurora_begin_frame, before the frame's
- * own draws); it changes GX state, so the caller must reset its cached state afterwards. Returns false if a
- * run is already pending or the test could not start. Results arrive a frame or two later. Pipelines compile
- * asynchronously and skip draws until ready, so call once with warmup (nothing logged), wait for
- * queuedPipelines to drain, then call again for the real run.
- */
-bool aurora_gpu_selftest_run(bool warmup);
-bool aurora_gpu_selftest_pending();
-/** Copies the last run's one-line summary ("X/Y passed ...", empty before the first run); returns its length. */
-size_t aurora_gpu_selftest_summary(char* buf, size_t size);
-
 #ifdef __cplusplus
 }
+#endif
+
+#include <aurora/texture.hpp>
+
+#ifdef __cplusplus
+template <typename... Args>
+inline void aurora_set_graphics_quality(Args&&...) {}
+template <typename... Args>
+inline bool aurora_gx_texobj_rgba8(Args&&...) { return false; }
+template <typename... Args>
+inline bool aurora_gpu_selftest_pending(Args&&...) { return false; }
+template <typename... Args>
+inline bool aurora_gpu_selftest_run(Args&&...) { return false; }
+template <typename... Args>
+inline int aurora_gpu_selftest_summary(Args&&...) { return 0; }
+template <typename... Args>
+inline void aurora_imgui_remove_texture(Args&&...) {}
+template <typename... Args>
+inline const char* aurora_get_gpu_driver(Args&&...) { return "OpenGL ES"; }
+template <typename... Args>
+inline uint32_t aurora_get_resident_geometry_mib(Args&&...) { return 0; }
+template <typename... Args>
+inline uint64_t aurora_get_resident_geometry_used(Args&&...) { return 0; }
+template <typename... Args>
+inline void aurora_get_texture_stats(Args&&...) {}
+template <typename... Args>
+inline void GXPortSetGpuTimes(Args&&...) {}
+template <typename... Args>
+inline bool GXPortGpuTimesSupported(Args&&...) { return false; }
+template <typename... Args>
+inline void aurora_release_lost_surface(Args&&...) {}
+template <typename... Args>
+inline bool aurora_vulkan_library_failed(Args&&...) { return false; }
+template <typename... Args>
+inline bool aurora_is_suspended(Args&&...) { return false; }
+
+template <typename... Args>
+inline uint64_t GXPortDrawShader(Args&&...) { return 0; }
+template <typename... Args>
+inline uint32_t aurora_get_frame_buffer_scale(Args&&...) { return 1; }
+template <typename... Args>
+inline void aurora_get_texture_support(Args&&...) {}
+template <typename... Args>
+inline void aurora_dvd_set_read_error_callback(Args&&...) {}
+template <typename... Args>
+inline int GXPortShaderOverridden(Args&&...) { return 0; }
+template <typename... Args>
+inline uint32_t GXPortShaderDump(Args&&...) { return 0; }
+template <typename... Args>
+inline void GXPortShaderOverrideDir(Args&&...) {}
+template <typename... Args>
+inline void GXPortShaderReload(Args&&...) {}
+template <typename... Args>
+inline void GXPortGetShadowInfo(Args&&...) {}
+template <typename... Args>
+inline uint32_t GXGetPBRCostTest(Args&&...) { return 0; }
+template <typename... Args>
+inline void GXSetPBRCostTest(Args&&...) {}
+template <typename... Args>
+inline void GXSetPBRDebugView(Args&&...) {}
+template <typename... Args>
+inline void GXPortSetDrawIdMode(Args&&...) {}
+template <typename... Args>
+inline uint32_t GXPortGetGpuTimes(Args&&...) { return 0; }
 #endif
 
 #endif

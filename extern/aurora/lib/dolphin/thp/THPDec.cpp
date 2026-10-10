@@ -1,10 +1,45 @@
 #include "dolphin/thp.h"
 
 #include "../../internal.hpp"
+#include "../../io.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <span>
+
+namespace aurora {
+struct ByteReader {
+  const u8* start;
+  const u8* ptr;
+
+  static ByteReader unbounded(const void* p) noexcept {
+    auto u = static_cast<const u8*>(p);
+    return ByteReader{u, u};
+  }
+
+  bool try_read(u8& val) noexcept {
+    val = *ptr++;
+    return true;
+  }
+
+  bool try_read(u16& val) noexcept {
+    val = static_cast<u16>((static_cast<u16>(ptr[0]) << 8) | static_cast<u16>(ptr[1]));
+    ptr += 2;
+    return true;
+  }
+
+  bool try_take(size_t len, std::span<const u8>& out) noexcept {
+    out = std::span<const u8>(ptr, len);
+    ptr += len;
+    return true;
+  }
+
+  size_t offset() const noexcept {
+    return static_cast<size_t>(ptr - start);
+  }
+};
+} // namespace aurora
 
 namespace {
 // Error codes

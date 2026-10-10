@@ -12,25 +12,21 @@ static u32 AR_StackPointer;
 static u32* AR_BlockLength;
 static u32 AR_FreeBlocks;
 static BOOL AR_init_flag;
-static u32* sAllocationStackBase;
 
 #define ARAM_STACK_START 0x4000
 
 // Port (Metroid Prime): defer ARQ completion callbacks. The game's ARAM
 // interrupt handler posts the next transfer from inside the callback, so
-// invoking it synchronously recurses until the stack overflows. Queue instead
-// and drain via ARQPoll() (called from the game loop beside aurora_update).
+// invoking it synchronously recurses until the stack overflows or corrupts state.
+// Queue instead and drain via ARQPoll() (called from the game loop beside aurora_update).
 namespace {
 std::mutex s_arqMutex;
-std::deque<std::pair<ARQCallback, uintptr_t> > s_arqPending;
+std::deque<std::pair<ARQCallback, uintptr_t>> s_arqPending;
 } // namespace
 
 static bool s_arqPolling = false;
 
 extern "C" void ARQPoll() {
-  // Re-entrant calls (a callback posting the next transfer) just enqueue; the
-  // outermost loop drains them all iteratively, so the game's ping-pong ARAM
-  // chain never grows the stack.
   if (s_arqPolling) {
     return;
   }
@@ -52,6 +48,7 @@ extern "C" void ARQPoll() {
   s_arqPolling = false;
 }
 
+
 // ARAM emulation: allocate a large buffer to simulate the GameCube's Auxiliary RAM.
 // ARAM "addresses" are offsets into this buffer. On GameCube, ARAM is 16 MB starting
 // at a base address returned by ARInit. We emulate this by malloc'ing a buffer
@@ -69,10 +66,9 @@ static u8* aramToHost(u32 aramAddr) {
 u32 ARAlloc(u32 length) {
   u32 tmp;
 
-  AURORA_ASSERT(AR_init_flag && !(length & 0x1f), "ARAlloc: uninitialized or unaligned allocation");
-  AURORA_ASSERT(AR_StackPointer <= aurora::g_config.mem2Size &&
-                    length <= aurora::g_config.mem2Size - AR_StackPointer && AR_FreeBlocks != 0,
-                "ARAlloc: out of ARAM or allocation slots");
+  ASSERTMSGLINE(430, !(length & 0x1F), "ARAlloc(): length is not multiple of 32bytes!");
+  ASSERTMSGLINE(434, length <= (__AR_Size - __AR_StackPointer), "ARAlloc(): Out of ARAM!");
+  ASSERTMSGLINE(435, __AR_FreeBlocks, "ARAlloc(): No more free blocks!");
 
   tmp = AR_StackPointer;
   AR_StackPointer += length;
@@ -83,7 +79,6 @@ u32 ARAlloc(u32 length) {
 }
 
 u32 ARFree(u32* length) {
-  AURORA_ASSERT(AR_init_flag && AR_BlockLength > sAllocationStackBase, "ARFree: empty allocation stack");
   AR_BlockLength -= 1;
   if (length) {
     *length = *AR_BlockLength;
@@ -115,7 +110,6 @@ u32 ARInit(u32* stack_index_addr, u32 num_entries) {
   AR_StackPointer = ARAM_STACK_START;
   AR_FreeBlocks = num_entries;
   AR_BlockLength = stack_index_addr;
-  sAllocationStackBase = stack_index_addr;
 
   AR_init_flag = TRUE;
   return AR_StackPointer;
@@ -128,13 +122,6 @@ u32 ARGetSize(void) { return aurora::g_config.mem2Size; }
 #endif
 void ARQPostRequest(ARQRequest* request, u32 owner, u32 type, u32 priority, uintptr_t source, uintptr_t dest,
                     u32 length, ARQCallback callback) {
-  AURORA_ASSERT(type == ARAM_DIR_MRAM_TO_ARAM || type == ARAM_DIR_ARAM_TO_MRAM,
-                "Invalid ARAM DMA direction {}", type);
-  const uintptr_t offset = type == ARAM_DIR_MRAM_TO_ARAM ? dest : source;
-  const uintptr_t host = type == ARAM_DIR_MRAM_TO_ARAM ? source : dest;
-  AURORA_ASSERT(sAramBuffer != nullptr && offset <= aurora::g_config.mem2Size &&
-                    length <= aurora::g_config.mem2Size - offset && (host != 0 || length == 0),
-                "Invalid ARAM DMA: offset={}, length={}, capacity={}", offset, length, aurora::g_config.mem2Size);
   // Emulate ARAM DMA transfers using memcpy.
   // type 0 = MRAM -> ARAM, type 1 = ARAM -> MRAM
   if (type == ARAM_DIR_MRAM_TO_ARAM) {

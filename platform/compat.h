@@ -11,9 +11,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __cplusplus
 // The native build uses host new/delete. CMemory allocations have a separate
 // lifetime and must be returned explicitly through CMemory::Free.
 #include <Kyoto/Alloc/CMemory.hpp>
+#endif
 
 // MWCC-isms used throughout the decompiled code.
 #define nofralloc
@@ -32,6 +34,7 @@ extern "C" {
 #endif
 // Port: drains Aurora's deferred ARQ completion callbacks (see AR.cpp).
 void ARQPoll(void);
+s32 CARDFormatAsync(s32 chan, CARDCallback callback);
 #ifdef __cplusplus
 }
 #endif

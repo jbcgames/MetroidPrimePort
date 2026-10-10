@@ -1038,6 +1038,9 @@ bool salInitAi(SND_SOME_CALLBACK callback, u32 flags, u32* outFreq) {
   };
   if (salAudioSubsystemInitialized) {
     salAudioStream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+    if (salAudioStream != NULL) {
+      SDL_SetAudioStreamGain(salAudioStream, 0.75f);
+    }
   }
   if (salAudioStream == NULL) {
     fprintf(stderr, "MusyX: audio device unavailable, running silently: %s\n", SDL_GetError());

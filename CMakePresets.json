@@ -1,0 +1,36 @@
+{
+  "version": 2,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "linux-aarch64-gles",
+      "displayName": "Linux aarch64 GLES (RK3326 / Mali-G31)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-aarch64-gles",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchain-aarch64-linux-gnu.cmake",
+        "AURORA_SDL3_PROVIDER": "vendor",
+        "AURORA_SDL3_LINKAGE": "static",
+        "AURORA_USE_GLES": "ON",
+        "SDL_UNIX_CONSOLE_BUILD": true,
+        "SDL_X11": "OFF",
+        "SDL_WAYLAND": "OFF",
+        "AURORA_NOD_PROVIDER": "vendor",
+        "MP_BUILD_TESTS": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "linux-aarch64-gles",
+      "configurePreset": "linux-aarch64-gles",
+      "displayName": "Linux aarch64 GLES (RK3326)",
+      "targets": ["metroid_prime_port"]
+    }
+  ]
+}

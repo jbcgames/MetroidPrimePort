@@ -1,9 +1,6 @@
 #include "CardGciFolder.hpp"
 
-#include <algorithm>
 #include <cstring>
-
-#include <SDL3/SDL_filesystem.h>
 
 #include <filesystem>
 #include "../io.hpp"
@@ -19,14 +16,14 @@ aurora::Module Log("aurora::card");
 namespace aurora::card {
 
 CardGciFolder::GciFile* CardGciFolder::get_file(uint32_t idx) {
-  if (m_error == ECardResult::READY && m_files.size() > idx && !m_files[idx].deleted) {
+  if (m_files.size() > idx) {
     return &m_files[idx];
   }
   return nullptr;
 }
 
 const CardGciFolder::GciFile* CardGciFolder::get_file(uint32_t idx) const {
-  if (m_error == ECardResult::READY && m_files.size() > idx && !m_files[idx].deleted) {
+  if (m_files.size() > idx) {
     return &m_files[idx];
   }
   return nullptr;
@@ -46,7 +43,7 @@ CardGciFolder::CardGciFolder() {}
 
 CardGciFolder::CardGciFolder(CardGciFolder&& other) {
   m_files = std::move(other.m_files);
-  m_error = other.m_error;
+  m_bat = std::move(other.m_bat);
   m_folderPath = other.m_folderPath;
   m_encoding = other.m_encoding;
 
@@ -56,7 +53,7 @@ CardGciFolder::CardGciFolder(CardGciFolder&& other) {
 
 CardGciFolder& CardGciFolder::operator=(CardGciFolder&& other) {
   m_files = std::move(other.m_files);
-  m_error = other.m_error;
+  m_bat = std::move(other.m_bat);
   m_folderPath = other.m_folderPath;
   m_encoding = other.m_encoding;
 
@@ -71,108 +68,69 @@ void CardGciFolder::InitCard(const char* game, const char* maker) {
   setCurrentMaker(maker);
 }
 
-int32_t CardGciFolder::find_file(const char* filename) const {
-  if (std::strlen(filename) > CARD_FILENAME_MAX) {
-    return -1;
-  }
-  for (size_t idx = 0; idx < m_files.size(); ++idx) {
-    const auto& entry = m_files[idx];
-    if (!entry.deleted && std::memcmp(entry.file.m_game, m_game, 4) == 0 &&
-        std::memcmp(entry.file.m_maker, m_maker, 2) == 0 &&
-        std::strncmp(entry.file.m_filename, filename, CARD_FILENAME_MAX) == 0) {
-      return static_cast<int32_t>(idx);
-    }
-  }
-  return -1;
-}
-
 ECardResult CardGciFolder::openFile(const char* filename, FileHandle& handleOut) {
-  if (m_error != ECardResult::READY) {
-    return m_error;
+  int idx = 0;
+  for (auto& gciFile : m_files) {
+    if (strcmp(filename, gciFile.file.m_filename) == 0) {
+      gciFile.opened = true;
+      if (gciFile.fileSize == 0)
+        gciFile.fileSize = std::filesystem::file_size(m_folderPath / gciFile.filename);
+
+      handleOut = FileHandle(idx, 0);
+      return ECardResult::READY;
+    }
+    idx++;
   }
-  const auto idx = find_file(filename);
-  return idx < 0 ? ECardResult::NOFILE : openFile(static_cast<uint32_t>(idx), handleOut);
+
+  return ECardResult::NOFILE;
 }
 
 ECardResult CardGciFolder::openFile(uint32_t fileno, FileHandle& handleOut) {
-  if (m_error != ECardResult::READY) {
-    return m_error;
-  }
-  if (auto* file = get_file(fileno)) {
-    handleOut = FileHandle{fileno, 0};
-    file->opened = true;
+  if (m_files.size() > fileno) {
+    auto& gciFile = m_files[fileno];
+    handleOut = FileHandle(fileno, 0);
+    gciFile.opened = true;
+    if (gciFile.fileSize == 0)
+      gciFile.fileSize = std::filesystem::file_size(m_folderPath / gciFile.filename);
+
     return ECardResult::READY;
   }
+
   return ECardResult::NOFILE;
 }
 
 ECardResult CardGciFolder::createFile(const char* filename, size_t size, FileHandle& handleOut) {
-  if (m_error != ECardResult::READY) {
-    return m_error;
-  }
-  if (std::strlen(filename) > CARD_FILENAME_MAX) {
-    return ECardResult::NAMETOOLONG;
-  }
-  if (size == 0 || size % BlockSize != 0) {
-    return ECardResult::FATAL_ERROR;
-  }
-  if (find_file(filename) >= 0) {
-    return ECardResult::EXIST;
-  }
-  int32_t freeBytes, freeFiles;
-  getFreeBlocks(freeBytes, freeFiles);
-  if (freeFiles <= 0) {
-    return ECardResult::NOENT;
-  }
-  if (size > static_cast<size_t>(freeBytes)) {
-    return ECardResult::INSSPACE;
-  }
-
-  std::string baseName = fmt::format("{}-{}-{}", m_maker, m_game, filename);
-  for (char& c : baseName) {
-    if (static_cast<unsigned char>(c) < 32 || std::strchr("<>:\"/\\|?*", c)) {
-      c = '_';
-    }
-  }
-  auto diskName = io::fs_path_from_string(baseName + ".gci");
-  // CARD filenames are case-sensitive even when the filesystem isn't.
   std::error_code ec;
-  for (uint32_t suffix = 1; std::filesystem::exists(m_folderPath / diskName, ec) && !ec; ++suffix) {
-    diskName = io::fs_path_from_string(fmt::format("{}-{}.gci", baseName, suffix));
-  }
-  if (ec) {
+  std::filesystem::create_directories(m_folderPath, ec);
+
+  std::string gciFilename = fmt::format("{}-{}-{}.gci", m_maker, m_game, filename);
+  uint16_t neededBlocks = ROUND_UP_8192(size) / BlockSize;
+  size_t fileSize = sizeof(File) + size;
+  constexpr uint16_t maxBlocks = ((uint16_t)ECardSize::Card2043Mb * MbitToBlocks) - FSTBlocks;
+
+  std::vector<uint8_t> fileBuf(fileSize);
+
+  File* gciFileHeader = (File*)fileBuf.data();
+
+  std::memcpy(gciFileHeader->m_game, m_game, 4);
+  std::memcpy(gciFileHeader->m_maker, m_maker, 2);
+  strncpy(gciFileHeader->m_filename, filename, std::size(gciFileHeader->m_filename));
+
+  gciFileHeader->m_modifiedTime = static_cast<uint32_t>(getGCTime());
+  gciFileHeader->m_blockCount = neededBlocks;
+  gciFileHeader->m_firstBlock = m_bat.allocateBlocks(neededBlocks, maxBlocks);
+
+  // write big endian header for dolphin compat
+  gciFileHeader->swapEndian();
+  FileIO file(m_folderPath / gciFilename, true);
+  if (!file || !file.fileWrite(fileBuf.data(), fileBuf.size(), 0)) {
     return ECardResult::IOERROR;
   }
 
-  File header{filename};
-  std::memcpy(header.m_game, m_game, 4);
-  std::memcpy(header.m_maker, m_maker, 2);
-  header.m_modifiedTime = static_cast<uint32_t>(getGCTime());
-  header.m_blockCount = static_cast<uint16_t>(size / BlockSize);
-  header.m_firstBlock = FSTBlocks;
-  header.m_permissions = EPermissions::Public;
-  header.m_iconAddress = UINT32_MAX;
-  header.m_commentAddr = UINT32_MAX;
-  header.m_animSpeed = 1;
+  gciFileHeader->swapEndian();
+  m_files.push_back({*gciFileHeader, fileSize, reinterpret_cast<const char8_t*>(gciFilename.c_str()), true});
+  handleOut = FileHandle(m_files.size() - 1, 0);
 
-  std::vector<uint8_t> fileBuf;
-  fileBuf.resize(sizeof(File) + size);
-  File diskHeader = header;
-  diskHeader.swapEndian();
-  std::memcpy(fileBuf.data(), &diskHeader, sizeof(File));
-  if (!io::write_file_atomic(m_folderPath / diskName, fileBuf)) {
-    return ECardResult::IOERROR;
-  }
-
-  const auto freeSlot = std::ranges::find_if(m_files, [](const auto& file) { return file.deleted; });
-  const auto idx = static_cast<uint32_t>(freeSlot - m_files.begin());
-  GciFile entry{header, fileBuf.size(), diskName.u8string(), true};
-  if (freeSlot == m_files.end()) {
-    m_files.push_back(std::move(entry));
-  } else {
-    *freeSlot = std::move(entry);
-  }
-  handleOut = FileHandle{idx, 0};
   return ECardResult::READY;
 }
 
@@ -186,63 +144,59 @@ ECardResult CardGciFolder::closeFile(FileHandle& fh) {
   return ECardResult::NOFILE;
 }
 
-void CardGciFolder::deleteFile(const FileHandle& fh) { deleteFile(fh.getFileNo()); }
+void CardGciFolder::deleteFile(const FileHandle& fh) {
+  auto file = get_open_file(fh);
+  if (!file)
+    return;
+
+  FileIO fileIO(m_folderPath / file->filename, true);
+  if (fileIO)
+    fileIO.deleteFile();
+
+  if (fh.getFileNo() < m_files.size()) {
+    m_files.erase(m_files.begin() + fh.getFileNo());
+  }
+}
 
 ECardResult CardGciFolder::deleteFile(const char* filename) {
-  if (m_error != ECardResult::READY) {
-    return m_error;
+  for (auto it = m_files.begin(); it != m_files.end(); ++it) {
+    if (strcmp(filename, it->file.m_filename) == 0) {
+      FileIO fileIO(m_folderPath / it->filename, true);
+      if (fileIO)
+        fileIO.deleteFile();
+      m_files.erase(it);
+      return ECardResult::READY;
+    }
   }
-  const auto idx = find_file(filename);
-  return idx < 0 ? ECardResult::NOFILE : deleteFile(static_cast<uint32_t>(idx));
+  return ECardResult::NOFILE;
 }
 
 ECardResult CardGciFolder::deleteFile(uint32_t fileno) {
-  if (m_error != ECardResult::READY) {
-    return m_error;
+  if (fileno < m_files.size()) {
+    auto it = m_files.begin() + fileno;
+    FileIO fileIO(m_folderPath / it->filename, true);
+    if (fileIO)
+      fileIO.deleteFile();
+    m_files.erase(it);
+    return ECardResult::READY;
   }
-  auto* file = get_file(fileno);
-  if (!file) {
-    return ECardResult::NOFILE;
-  }
-  const auto deletedPath = m_folderPath / "_deleted";
-  const auto source = io::fs_path_to_string(m_folderPath / file->filename);
-  const auto destination = io::fs_path_to_string(deletedPath / file->filename);
-  if (!io::create_directories(deletedPath) || !SDL_RenamePath(source.c_str(), destination.c_str())) {
-    return ECardResult::IOERROR;
-  }
-  file->opened = false;
-  file->deleted = true;
-  file->dirty = false;
-  return ECardResult::READY;
+  return ECardResult::NOFILE;
 }
 
 ECardResult CardGciFolder::renameFile(const char* oldName, const char* newName) {
-  if (m_error != ECardResult::READY) {
-    return m_error;
+  for (auto& gciFile : m_files) {
+    if (strcmp(oldName, gciFile.file.m_filename) == 0) {
+      strncpy(gciFile.file.m_filename, newName, std::size(gciFile.file.m_filename));
+      return ECardResult::READY;
+    }
   }
-  if (std::strlen(newName) > CARD_FILENAME_MAX) {
-    return ECardResult::NAMETOOLONG;
-  }
-  const auto idx = find_file(oldName);
-  if (idx < 0) {
-    return ECardResult::NOFILE;
-  }
-  if (find_file(newName) >= 0) {
-    return ECardResult::EXIST;
-  }
-  auto& file = m_files[idx];
-  std::strncpy(file.file.m_filename, newName, CARD_FILENAME_MAX);
-  file.dirty = true;
-  return ECardResult::READY;
+
+  return ECardResult::NOFILE;
 }
 
 ECardResult CardGciFolder::fileWrite(FileHandle& fh, const void* buf, size_t size) {
   auto file = get_open_file(fh);
   if (file) {
-    const size_t dataSize = file->fileSize - sizeof(File);
-    if (fh.offset < 0 || static_cast<size_t>(fh.offset) > dataSize || size > dataSize - fh.offset) {
-      return ECardResult::LIMIT;
-    }
     FileIO fileIO(m_folderPath / file->filename);
     if (fileIO) {
       if (fileIO.fileWrite(buf, size, sizeof(File) + fh.offset))
@@ -252,16 +206,12 @@ ECardResult CardGciFolder::fileWrite(FileHandle& fh, const void* buf, size_t siz
     return ECardResult::NOFILE;
   }
 
-  return ECardResult::NOCARD;
+  return ECardResult::NOFILE;
 }
 
 ECardResult CardGciFolder::fileRead(FileHandle& fh, void* dst, size_t size) {
   auto file = get_open_file(fh);
   if (file) {
-    const size_t dataSize = file->fileSize - sizeof(File);
-    if (fh.offset < 0 || static_cast<size_t>(fh.offset) > dataSize || size > dataSize - fh.offset) {
-      return ECardResult::LIMIT;
-    }
     FileIO fileIO(m_folderPath / file->filename);
     if (fileIO) {
       if (fileIO.fileRead(dst, size, sizeof(File) + fh.offset))
@@ -271,7 +221,7 @@ ECardResult CardGciFolder::fileRead(FileHandle& fh, void* dst, size_t size) {
     return ECardResult::NOFILE;
   }
 
-  return ECardResult::NOCARD;
+  return ECardResult::NOFILE;
 }
 
 void CardGciFolder::seek(FileHandle& fh, int32_t pos, SeekOrigin whence) {
@@ -285,7 +235,7 @@ void CardGciFolder::seek(FileHandle& fh, int32_t pos, SeekOrigin whence) {
       fh.offset += pos;
       break;
     case SeekOrigin::End:
-      fh.offset = file->fileSize - sizeof(File) - pos;
+      fh.offset = file->fileSize - pos;
       break;
     }
   }
@@ -362,7 +312,6 @@ ECardResult CardGciFolder::setStatus(uint32_t fileNo, const CardStat& stat) {
   file->m_iconFmt = stat.x34_iconFormat;
   file->m_animSpeed = stat.x36_iconSpeed;
   file->m_commentAddr = stat.x38_commentAddr;
-  gciFile->dirty = true;
 
   return ECardResult::READY;
 }
@@ -396,15 +345,7 @@ const uint8_t* CardGciFolder::getCurrentMaker() const {
 }
 
 void CardGciFolder::getSerial(uint64_t& serial) {
-  // A folder has no card header to take a serial from, but games read 0 as "no
-  // card": Metroid Prime's save stations then close without offering a save.
-  // Derive one from the folder's path instead (FNV-1a), which is stable across
-  // launches, as the in-game "not the original card" check needs.
-  uint64_t hash = 0xcbf29ce484222325ull;
-  for (const char c : m_folderPath.generic_string()) {
-    hash = (hash ^ static_cast<uint8_t>(c)) * 0x100000001b3ull;
-  }
-  serial = hash != 0 ? hash : 1;
+  serial = 0; // TODO
 }
 
 void CardGciFolder::getChecksum(uint16_t& checksum, uint16_t& inverse) const {
@@ -414,58 +355,32 @@ void CardGciFolder::getChecksum(uint16_t& checksum, uint16_t& inverse) const {
 }
 
 void CardGciFolder::getFreeBlocks(int32_t& bytesNotUsed, int32_t& filesNotUsed) const {
-  bytesNotUsed = (static_cast<uint32_t>(ECardSize::Card2043Mb) * MbitToBlocks - FSTBlocks) * BlockSize;
+  bytesNotUsed = m_bat.numFreeBlocks() * BlockSize;
   filesNotUsed = MaxFiles;
-  for (const auto& file : m_files) {
-    if (!file.deleted) {
-      bytesNotUsed -= file.file.m_blockCount * BlockSize;
-      --filesNotUsed;
-    }
-  }
-  bytesNotUsed = std::max(bytesNotUsed, 0);
 }
 
 void CardGciFolder::getEncoding(uint16_t& encoding) const { encoding = (uint16_t)m_encoding; }
 
-ECardResult CardGciFolder::format(ECardSlot deviceId, ECardSize size, EEncoding encoding) {
+void CardGciFolder::format(ECardSlot deviceId, ECardSize size, EEncoding encoding) {
   m_encoding = encoding;
-  if (m_folderPath.empty() || !io::create_directories(m_folderPath)) {
-    return ECardResult::IOERROR;
+
+  if (!io::create_directories(m_folderPath)) {
+    Log.error("Failed to create directory {}: {}", io::fs_path_to_string(m_folderPath), SDL_GetError());
   }
-  return m_error = ECardResult::READY;
 }
 
-ECardResult CardGciFolder::commit() {
-  if (m_error != ECardResult::READY) {
-    return m_error;
-  }
+void CardGciFolder::commit() {
   for (auto& gciFile : m_files) {
-    if (gciFile.deleted || !gciFile.dirty) {
-      continue;
-    }
-    FileIO file{m_folderPath / gciFile.filename};
+    FileIO file(m_folderPath / gciFile.filename);
+
     File tempFile = gciFile.file;
     tempFile.swapEndian();
-    if (!file || !file.fileWrite(&tempFile, sizeof(File), 0)) {
-      if (file && file.fileRead(&tempFile, sizeof(File), 0)) {
-        tempFile.swapEndian();
-        gciFile.file = tempFile;
-        gciFile.dirty = false;
-      } else {
-        m_error = ECardResult::IOERROR;
-      }
-      return ECardResult::IOERROR;
-    }
-    gciFile.dirty = false;
+    file.fileWrite(&tempFile, sizeof(File), 0); // update header
   }
-  return ECardResult::READY;
 }
 
 bool CardGciFolder::open(const std::filesystem::path& filepath) {
-  m_files.clear();
-  m_error = ECardResult::NOCARD;
   m_folderPath = filepath;
-  std::vector<GciFile> files;
 
   std::error_code ec;
   if (!std::filesystem::exists(filepath, ec) || !std::filesystem::is_directory(filepath, ec)) {
@@ -475,8 +390,7 @@ bool CardGciFolder::open(const std::filesystem::path& filepath) {
     return false;
   }
 
-  m_error = ECardResult::IOERROR;
-  std::filesystem::directory_iterator it{filepath, ec};
+  std::filesystem::directory_iterator it(filepath, std::filesystem::directory_options::skip_permission_denied, ec);
   if (ec) {
     Log.warn("Failed to enumerate GCI folder '{}': {}", io::fs_path_to_string(filepath), ec.message());
     return false;
@@ -521,25 +435,7 @@ bool CardGciFolder::open(const std::filesystem::path& filepath) {
     }
     fileData.swapEndian();
 
-    for (const auto& existing : files) {
-      if (std::memcmp(existing.file.m_game, fileData.m_game, 4) == 0 &&
-          std::memcmp(existing.file.m_maker, fileData.m_maker, 2) == 0 &&
-          std::strncmp(existing.file.m_filename, fileData.m_filename, CARD_FILENAME_MAX) == 0) {
-        Log.warn("Duplicate CARD identity in GCI folder: '{}' and '{}'", io::fs_path_to_string(existing.filename),
-                 io::fs_path_to_string(path));
-        m_error = ECardResult::BROKEN;
-        return false;
-      }
-    }
-    if (files.size() == MaxFiles) {
-      m_error = ECardResult::BROKEN;
-      return false;
-    }
-    const auto fileSize = file.fileSize();
-    if (fileSize < sizeof(File)) {
-      return false;
-    }
-    files.push_back({fileData, fileSize, path.filename().u8string(), false});
+    m_files.push_back({fileData, file.fileSize(), path.filename().u8string(), false});
 
     it.increment(ec);
     if (ec) {
@@ -548,22 +444,20 @@ bool CardGciFolder::open(const std::filesystem::path& filepath) {
     }
   }
 
-  m_files = std::move(files);
-  m_error = ECardResult::READY;
   return true;
 }
 
 void CardGciFolder::close() {
   m_files.clear();
   m_folderPath = "";
-  m_error = ECardResult::NOCARD;
+  m_bat = BlockAllocationTable();
 }
 
 static std::filesystem::path g_cardFileNameEmpty = "";
 
 const std::filesystem::path& CardGciFolder::cardFilename() const { return g_cardFileNameEmpty; }
 
-ECardResult CardGciFolder::getError() const { return m_error; }
+ECardResult CardGciFolder::getError() const { return ECardResult::READY; }
 
 ProbeResults CardGciFolder::probeCardFile(const std::filesystem::path& filename) {
   if (!std::filesystem::exists(filename) || !std::filesystem::is_directory(filename))

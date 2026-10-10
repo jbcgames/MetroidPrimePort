@@ -6,8 +6,7 @@ if(GIT_EXECUTABLE)
     if(git_root STREQUAL SOURCE_DIR)
         execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${SOURCE_DIR}" rev-parse --short=12 HEAD
             OUTPUT_VARIABLE revision OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${SOURCE_DIR}" diff --quiet HEAD --
-            RESULT_VARIABLE dirty ERROR_QUIET)
+        set(dirty 1)
         if(NOT dirty EQUAL 0)
             string(APPEND revision "-dirty")
         endif()

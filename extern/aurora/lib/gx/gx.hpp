@@ -3,7 +3,7 @@
 #include <aurora/math.hpp>
 
 #include "../internal.hpp"
-#include "../gfx/types.hpp"
+#include "../gfx/common.hpp"
 #include "../gfx/texture.hpp"
 
 #include <absl/container/flat_hash_map.h>
@@ -51,20 +51,6 @@ constexpr bool UsePerPixelLighting = false;
 constexpr bool UseReversedZ = true;
 
 constexpr u32 MaxTextures = GX_MAX_TEXMAP;
-// Group 2 binding of the PBR environment BRDF table, after the probe, its sampler and the volumes.
-constexpr u32 kBrdfLutBinding = MaxTextures * 2 + 7;
-// Group 2 bindings of the volumetric fog's froxels and their sampler (ShaderConfig::volFog).
-constexpr u32 kVolFogFroxelBinding = MaxTextures * 2 + 8;
-constexpr u32 kVolFogSamplerBinding = MaxTextures * 2 + 9;
-// A shadow receiver (shadow_receives) never fogs per pixel, so its group 2 layout puts the sun's shadow map and
-// comparison sampler in the froxel's slots: group 2 already holds WebGPU's default 16 sampled textures.
-constexpr u32 kShadowMapBinding = kVolFogFroxelBinding;
-constexpr u32 kShadowSamplerBinding = kVolFogSamplerBinding;
-// A baked lightmap's 2D array (GX_AURORA_SET_PBR_LIGHTMAP), read with the probe's sampler. It is the 17th
-// sampled texture of group 2, one past WebGPU's default limit, so the layout has it only when the device was
-// given more (webgpu::g_lightmapBinding); kTextureBindings counts it.
-constexpr u32 kLightmapBinding = MaxTextures * 2 + 10;
-constexpr u32 kTextureBindings = MaxTextures * 2 + 11;
 constexpr u32 MaxTluts = 20;
 constexpr u32 MaxTevStages = GX_MAX_TEVSTAGE;
 constexpr u32 MaxColorChannels = 4;
@@ -80,28 +66,9 @@ constexpr u32 MaxIndTexMtxs = 3;
 constexpr u32 MaxVtxFmt = GX_MAX_VTXFMT;
 constexpr u32 MaxPnMtx = (GX_PNMTX9 / 3) + 1;
 constexpr u32 MaxIndexAttr = 12; // VA_POS -> VA_TEX7
-constexpr u32 MaxUniformSize = 8192; // WebGPU guarantees maxUniformBufferBindingSize >= 16384
-constexpr u32 XfRegCount = 0x58; // 0x1000-0x1057
+constexpr u32 MaxUniformSize = 3840;
 
-enum DirtyFlag : u8 {
-  DirtyPipeline = 1 << 0,
-  DirtyTextures = 1 << 1,
-  DirtyUniform = 1 << 2,
-  DirtyImmediates = 1 << 3,
-  DirtyAll = DirtyPipeline | DirtyTextures | DirtyUniform | DirtyImmediates,
-};
-
-struct DrawImmediateData {
-  u32 vtxStart = 0;
-  u32 currentPnMtx = 0;
-  u32 fogRangeBase = 0;
-  u32 serial = 0; // the draw's serial, read by shaders built with ShaderConfig::drawId
-  std::array<u32, MaxIndexAttr> arrayStart{};
-};
-static_assert(std::has_unique_object_representations_v<DrawImmediateData>);
-static_assert(sizeof(DrawImmediateData) == 64);
-
-extern wgpu::BindGroup g_emptyTextureBindGroup;
+extern gl::BindingSet g_emptyTextureBindGroup;
 
 template <typename Arg, Arg Default>
 struct TevPass {
@@ -205,17 +172,13 @@ struct FogState {
   float b = 0.5f;
   float c = 0.f;
   Vec4<float> color;
-  std::array<u16, 10> rangeK{};
-  s16 rangeCenter = 0;
-  bool rangeEnabled = false;
   // Raw encoded register values for A/B reconstruction across separate BP writes
   u32 fog0Raw = 0; // 0xEE: encoded A parameter
   u32 fog1Raw = 0; // 0xEF: B mantissa
   u32 fog2Raw = 0; // 0xF0: B shift
 
   bool operator==(const FogState& rhs) const {
-    return type == rhs.type && a == rhs.a && b == rhs.b && c == rhs.c && color == rhs.color && rangeK == rhs.rangeK &&
-           rangeCenter == rhs.rangeCenter && rangeEnabled == rhs.rangeEnabled;
+    return type == rhs.type && a == rhs.a && b == rhs.b && c == rhs.c && color == rhs.color;
   }
   bool operator!=(const FogState& rhs) const { return !(*this == rhs); }
 };
@@ -304,17 +267,15 @@ struct Fog {
   float a = 0.f;
   float b = 0.5f;
   float c = 0.f;
-  float rangeCenter = 0.f;
-  std::array<Vec4<float>, 3> rangeK;
+  float pad = FLT_MAX;
 };
-static_assert(sizeof(Fog) == 80);
+static_assert(sizeof(Fog) == 32);
 struct AttrArray {
   const void* data;
   u32 size;
   u8 stride;
   bool le = true;
   gfx::Range cachedRange;
-  u32 baseIndex = 0; // GX_AURORA_LOAD_ARRAY_BASE_INDEX
 };
 inline bool operator==(const AttrArray& lhs, const AttrArray& rhs) {
   return lhs.data == rhs.data && lhs.size == rhs.size && lhs.stride == rhs.stride && lhs.le == rhs.le;
@@ -325,31 +286,9 @@ struct GXState {
   struct CopyTextureRef {
     gfx::TextureHandle handle;
     u32 revision = 0;
-    // Logical (unscaled) GXSetTexCopyDst size of the latest copy to this dest.
-    u32 width = 0;
-    u32 height = 0;
-    // copy_tex call that last wrote this pooled texture (trim_copy_sizes keeps the newest).
-    u64 lastCopy = 0;
 
     operator bool() const noexcept { return handle.operator bool(); }
   };
-  struct CopyTextureKey {
-    const void* dest = nullptr;
-    u32 width = 0;
-    u32 height = 0;
-    GXTexFmt format = GX_TF_I4;
-
-    bool operator==(const CopyTextureKey& rhs) const {
-      return dest == rhs.dest && width == rhs.width && height == rhs.height && format == rhs.format;
-    }
-
-    template <typename H>
-    friend H AbslHashValue(H h, const CopyTextureKey& key) {
-      return H::combine(std::move(h), key.dest, key.width, key.height, key.format);
-    }
-  };
-
-  // Decoded state
   std::array<PnMtx, MaxPnMtx> pnMtx;
   u32 currentPnMtx;
   Mat4x4<float> proj;
@@ -379,12 +318,20 @@ struct GXState {
   std::array<ColorChannelState, MaxColorChannels> colorChannelState;
   std::array<Light, GX::MaxLights> lights;
   std::array<TevStage, MaxTevStages> tevStages;
+  std::array<gfx::TextureBind, MaxTextures> textures;
   std::array<GXTexObj_, MaxTextures> loadedTextures;
   std::array<GXTlutObj_, MaxTluts> loadedTluts;
+  AuroraViewportPolicy viewportPolicy = AURORA_VIEWPORT_FIT;
+  gfx::Viewport logicalViewport{0.f, 0.f, 640.f, 480.f, 0.f, 1.f};
+  gfx::Viewport renderViewport{0.f, 0.f, 640.f, 480.f, 0.f, 1.f};
+  gfx::ClipRect logicalScissor{0, 0, 640, 480};
+  gfx::ClipRect renderScissor{0, 0, 640, 480};
   std::array<Mat3x4<float>, MaxTexMtx> texMtxs;
   std::array<Mat3x4<float>, MaxPTTexMtx> ptTexMtxs;
   std::array<TcgConfig, MaxTexCoord> tcgs;
   std::array<TexCoordScale, MaxTexCoord> texCoordScales;
+  u16 lastVtxSize = 0;
+  GXVtxFmt lastVtxFmt = GX_MAX_VTXFMT;
   std::array<GXAttrType, MaxVtxAttr> vtxDesc;
   std::array<VtxFmt, MaxVtxFmt> vtxFmts;
   std::array<TevSwap, MaxTevSwap> tevSwapTable{
@@ -396,6 +343,29 @@ struct GXState {
   std::array<IndStage, MaxIndStages> indStages;
   std::array<IndTexMtxInfo, MaxIndTexMtxs> indTexMtxs;
   std::array<AttrArray, MaxVtxAttr> arrays;
+  gfx::ClipRect texCopySrc;
+  GXTexFmt texCopyFmt;
+  u32 texCopyDstWidth = 0;
+  u32 texCopyDstHeight = 0;
+  bool texCopyDstWide = false;
+  const void* texCopyDest = nullptr;
+  struct CopyTextureKey {
+    const void* dest = nullptr;
+    u32 width = 0;
+    u32 height = 0;
+    GXTexFmt format = GX_TF_I4;
+
+    bool operator==(const CopyTextureKey& rhs) const {
+      return dest == rhs.dest && width == rhs.width && height == rhs.height && format == rhs.format;
+    }
+
+    template <typename H>
+    friend H AbslHashValue(H h, const CopyTextureKey& key) {
+      return H::combine(std::move(h), key.dest, key.width, key.height, key.format);
+    }
+  };
+  absl::flat_hash_map<const void*, CopyTextureRef> copyTextures;
+  absl::flat_hash_map<CopyTextureKey, CopyTextureRef> copyTextureCache;
   bool depthCompare = true;
   bool depthUpdate = true;
   bool colorUpdate = true;
@@ -404,93 +374,46 @@ struct GXState {
   u8 numIndStages = 0;
   u8 numTevStages = 0;
   u8 numTexGens = 0;
-  u8 pbr = 0; // GX_AURORA_SET_PBR: above 1, a cost test (GXSetPBRCostTest)
-  u8 sdf = 0; // GX_AURORA_SET_SDF
-  u8 depthPrepass = 0; // GX_AURORA_PORT_DEPTH_PREPASS
-  std::array<u32, 3> drawTag{0, UINT32_MAX, 0}; // GX_AURORA_SET_DRAW_TAG: asset, model index, material
-  u32 drawSerial = 0; // GX_AURORA_PORT_DRAW_SERIAL
-  bool drawIdMode = false; // GX_AURORA_PORT_DRAW_ID_MODE
-  Mat3x4<float> pbrProbe; // GX_AURORA_SET_PBR_PROBE
-  Vec4<float> pbrEmissive{1.f, 1.f, 1.f, 0.f}; // GX_AURORA_SET_PBR_MATERIAL
-  Vec4<float> pbrBacklight{0.f, 0.f, 0.f, 0.f};
-  Vec4<float> pbrLayer{0.f, 0.f, 0.f, 0.f};       // x: the edge width of a second layer's blend
-  Vec4<float> pbrLayerHeight{1.f, 0.f, 1.f, 0.f}; // scale and offset of each layer's height
-  Vec4<float> pbrParam{0.f, 0.f, 0.f, 0.f};       // the parameters of pbrLayer's kind (y; z its strength)
-  Vec4<float> pbrUp{0.f, 1.f, 0.f, 0.f};          // world up in view space
-  u32 pbrCube = 0; // GX_AURORA_SET_PBR_CUBE
-  Vec4<float> pbrCubeParams{0.f, 0.f, 0.f, 0.f}; // see GXSetPBRCube
-  std::array<Vec4<float>, 6> pbrAmbient{}; // GX_AURORA_SET_PBR_AMBIENT
-  bool pbrBrdfLut = false; // GX_AURORA_SET_PBR_BRDF_LUT: a table is bound
-  u32 pbrVolume = 0; // GX_AURORA_SET_PBR_VOLUME
-  std::array<Vec4<float>, 6> pbrVolumeRows{}; // see GXSetPBRVolume
-  u32 pbrLightmap = 0; // GX_AURORA_SET_PBR_LIGHTMAP
-  Vec4<float> pbrLightmapRect{};                  // offU, offV, scale (0: off), level
-  std::array<Vec4<float>, 3> pbrLightmapAxes{};   // xyz: a row taking a view-space normal to the lightmap's axes
-  u8 pbrLightmapAttr = GX_VA_NULL; // GX_AURORA_SET_PBR_LIGHTMAP_ATTR
-  std::array<Vec4<float>, 3> pbrTone{}; // GX_AURORA_SET_PBR_TONE
-  Vec4<float> pbrLightSkip{}; // GX_AURORA_SET_PBR_LIGHT_SKIP: x the mask
-  Vec4<float> pbrBakedLightModulation{1.f, 1.f, 1.f, 0.f}; // GX_AURORA_SET_PBR_BAKED_LIGHT_MODULATION
-  // GX_AURORA_SET_PBR_BACKLIGHT: the height plane; the back colour direction and strength;
-  // the top strength.
-  std::array<Vec4<float>, 3> pbrBacklightLights{};
-  Vec4<float> pbrLightScale{1.f, 1.f, 0.f, 0.f}; // GX_AURORA_SET_PBR_LIGHT_SCALE: diffuse, f0, -, fade
-  std::array<Vec4<float>, 8> pbrShield{}; // GX_AURORA_SET_PBR_SHIELD: CCH0..6, then AUVI xyz + DIFC.w
-  // GX_AURORA_SET_PBR_LIGHT_HDR, per light: colour (rgb, falloff + 1; w 0 = off), then
-  // (view position, r0), then (r1, -, -, -).
-  std::array<Vec4<float>, GX::MaxLights * 3> pbrLightHdr{};
-  // GX_AURORA_PORT_VOLUMETRIC_FOG up to its _END: the draws fog themselves (ShaderConfig::volFog)
-  // with the recorded fog's near, range, exposure and the start of the world's depth range (nearer is the viewmodel) and its tone curve.
-  bool volFog = false;
-  Vec4<float> volFogParams{};
-  std::array<Vec4<float>, 3> volFogTone{};
-  // GX_AURORA_PORT_SHADOW_*: the following draws are the world's (they cast and receive the sun's
-  // shadow), and this frame's sun (shadowActive) with its uniform (gfx/shadow.hpp's Uniform).
-  bool shadowCaster = false;
-  bool shadowCasterOnly = false; // they cast but aren't drawn (GXPortSetShadowCasterOnly)
-  bool shadowActive = false;
-  std::array<Vec4<float>, 10> shadowUniform{};
-
-  // GX2 polygon offset state
-  f32 frontOffset = 0.0f;
-  f32 frontScale = 0.0f;
-  f32 backOffset = 0.0f;
-  f32 backScale = 0.0f;
-  f32 clamp = 0.0f;
-
-  // View state
-  AuroraViewportPolicy viewportPolicy = AURORA_VIEWPORT_FIT;
-  gfx::Viewport logicalViewport{0.f, 0.f, 640.f, 480.f, 0.f, 1.f};
-  gfx::Viewport renderViewport{0.f, 0.f, 640.f, 480.f, 0.f, 1.f};
-  gfx::ClipRect logicalScissor{0, 0, 640, 480};
-  gfx::ClipRect renderScissor{0, 0, 640, 480};
-
-  // EFB copy state
-  gfx::ClipRect texCopySrc;
-  GXTexFmt texCopyFmt;
-  u32 texCopyDstWidth = 0;
-  u32 texCopyDstHeight = 0;
-  bool texCopyDstWide = false;
-  const void* texCopyDest = nullptr;
-  absl::flat_hash_map<const void*, CopyTextureRef> copyTextures;
-  absl::flat_hash_map<CopyTextureKey, CopyTextureRef> copyTextureCache;
-
-  // Cache state
-  std::array<gfx::TextureBind, MaxTextures> textures;
-  u16 lastVtxSize = 0;
-  GXVtxFmt lastVtxFmt = GX_MAX_VTXFMT;
-  u8 dirty = DirtyAll;
-
-  // Shadow registers
+  bool stateDirty = true;
+  bool pipelineDirty = true;
+  bool texturesDirty = true;
+  uint64_t uniformVersion = 1;
+  uint64_t pipelineVersion = 1;
+  uint64_t textureVersion = 1;
+  void mark_dirty() noexcept {
+    stateDirty = true;
+    pipelineDirty = true;
+    texturesDirty = true;
+    ++pipelineVersion;
+    ++textureVersion;
+    ++uniformVersion;
+  }
+  void mark_uniform_dirty() noexcept {
+    stateDirty = true;
+    ++uniformVersion;
+  }
+  void mark_texture_dirty() noexcept {
+    stateDirty = true;
+    texturesDirty = true;
+    ++textureVersion;
+  }
   std::array<u32, 0x100> bpRegCache = [] {
     std::array<u32, 0x100> regs{};
     regs[0xFE] = 0x00FFFFFF;
     return regs;
   }();
   std::bitset<0x100> bpRegValid;
+  std::array<u32, 0x100> xfRegCache{};
+  std::bitset<0x100> xfRegValid;
   std::array<u32, 0x100> cpRegCache{};
   std::bitset<0x100> cpRegValid;
-  std::array<u32, XfRegCount> xfRegCache{};
-  std::bitset<XfRegCount> xfRegValid;
+
+  // GX2 state
+  f32 frontOffset = 0.0f;
+  f32 frontScale = 0.0f;
+  f32 backOffset = 0.0f;
+  f32 backScale = 0.0f;
+  f32 clamp = 0.0f;
 
   void clearVtxSizeCache() { lastVtxFmt = GX_MAX_VTXFMT; }
 };
@@ -499,15 +422,12 @@ struct ShaderInfo;
 
 void initialize() noexcept;
 void shutdown() noexcept;
-void update() noexcept;
-void set_viewport_policy(AuroraViewportPolicy policy) noexcept;
 void clear_static_texture_cache() noexcept;
 void clear_copy_texture_cache() noexcept;
-void trim_copy_texture_cache() noexcept;
 void evict_copy_texture(const void* dest) noexcept;
-void trim_copy_sizes(const void* dest, size_t keep) noexcept;
 void evict_texture_object(u32 texObjId) noexcept;
 void evict_tlut_object(u32 tlutObjId) noexcept;
+void expire_texture_object_caches() noexcept;
 Vec2<uint32_t> logical_fb_size() noexcept;
 gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcept;
 gfx::ClipRect map_logical_scissor(const gfx::ClipRect& logicalScissor) noexcept;
@@ -515,12 +435,7 @@ void set_logical_viewport(const gfx::Viewport& viewport) noexcept;
 void set_render_viewport(const gfx::Viewport& viewport) noexcept;
 void set_logical_scissor(const gfx::ClipRect& scissor) noexcept;
 void set_render_scissor(const gfx::ClipRect& scissor) noexcept;
-void set_draw_sync_token(u16 token) noexcept;
-u16 draw_sync_token() noexcept;
 void copy_tex(const void* dest, GXBool clear) noexcept;
-void copy_probe_face(u32 face) noexcept;
-// Whether load_word is generated with the clamped storage read (Adreno 730 on Vulkan; see shader.cpp).
-bool storage_load_clamp_active() noexcept;
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept;
 void resolve_sampled_textures(const ShaderInfo& info) noexcept;
 
@@ -556,35 +471,20 @@ struct AttrConfig {
   u8 stride = 0;         // Array stride
   u8 frac = 0;
   bool le = true;
-  bool nbt3 = false; // GX_NRM_NBT3
-};
-// ShaderConfig::volFog, as Remastered's shaders fog each kind of draw after the full-screen fog.
-enum : u8 {
-  VolFogNone = 0,       // no fog: multiplying or subtracting blends, depth-only passes
-  VolFogBlended = 1,    // alpha blended, per vertex: colour T + in-scatter
-  VolFogAdditive = 2,   // added to the frame, per vertex: colour T
-  VolFogOpaque = 3,     // not blended, per pixel: as the full-screen pass
-  VolFogPremultiplied = 4, // ONE, INVSRCALPHA, per vertex: colour T + in-scatter alpha
+  bool nbt3 = false;     // GX_NRM_NBT3
+  bool operator==(const AttrConfig&) const noexcept = default;
 };
 struct ShaderConfig {
   u8 fogType = GX_FOG_NONE;
   u8 vtxStride = 0;
   u8 lineMode : 2 = 0; // 1 = GX_LINES, 2 = GX_LINESTRIP, 3 = GX_POINTS
-  u8 fogRangeEnabled : 1 = false;
-  u8 drawId : 1 = false; // debug view "drawid": the fragment is the draw serial (DrawImmediateData::serial)
-  // GX_AURORA_PORT_SHADOW_CASTER while a shadow frame is set: the draw casts into the sun's shadow
-  // map (an extra vs_shadow entry) and, when PBR, receives the sun through it.
-  u8 shadow : 1 = false;
-  u8 pad1 : 3 = 0;
-  u8 pbr = 0; // GX_AURORA_SET_PBR
-  u8 sdf = 0; // GX_AURORA_SET_SDF
-  u8 depthOnly = 0; // pass 1 of GX_AURORA_PORT_DEPTH_PREPASS: the colour is not written
-  u8 pbrKind = 0; // with pbr, the special surface kind (pbrLayer.y), a constant in the shader
-  // GXState::volFog: how the draw fogs itself (VolFog*), chosen from its blend.
-  u8 volFog = 0;
-  // With pbr, the vertex attribute holding the baked lightmap's UV (GX_VA_TEX0..7), or GX_VA_NULL: a varying in the shader.
-  u8 pbrLightmapAttr = GX_VA_NULL;
-  u8 pad2[3]{}; // keeps the struct free of padding (memcmp and hash)
+  // When set, vertices arrive as real hardware vertex attributes (CPU-expanded)
+  // rather than software-fetched from the vbuf/abuf SSBOs. Fixes the matrix-palette
+  // "porcupine" (pnmtxidx no longer flows through the miscompiled storage byte-load)
+  // and is the only vertex-fetch path that links on Mali (0 vertex SSBOs).
+  u8 nativeVertexFetch : 1 = 0;
+  u8 pad1 : 5 = 0;
+  u8 pad2 = 0;
   std::array<AttrConfig, MaxVtxAttr> attrs;
   std::array<TevSwap, MaxTevSwap> tevSwapTable;
   std::array<TevStage, MaxTevStages> tevStages;
@@ -598,10 +498,6 @@ struct ShaderConfig {
   bool operator==(const ShaderConfig& rhs) const { return memcmp(this, &rhs, sizeof(*this)) == 0; }
 };
 static_assert(std::has_unique_object_representations_v<ShaderConfig>);
-// Whether a draw samples the sun's shadow map: a lit PBR surface drawn in colour without per-pixel fog.
-inline bool shadow_receives(const ShaderConfig& sc) noexcept {
-  return sc.shadow && sc.pbr != 0 && sc.volFog == VolFogNone && sc.depthOnly == 0 && sc.lineMode == 0 && !sc.drawId;
-}
 
 struct PipelineConfig;
 
@@ -624,32 +520,26 @@ struct ShaderInfo {
   u32 uniformSize = 0;
   bool usesFog : 1 = false;
   bool lightingEnabled : 1 = false;
+  // True iff the shader reads the normal-matrix palette (nrm_mtx): any lit channel, emboss bump,
+  // or the normal-visualization debug path. Gates the 480B nrm_mtx upload for unlit draws.
+  bool usesNormals : 1 = false;
   u8 lineMode : 2 = 0;
-  bool usesPbr : 1 = false;
-  bool usesLightmap : 1 = false; // ShaderConfig::pbrLightmapAttr is set
-  bool usesVolFog : 1 = false;
-  bool usesShadow : 1 = false;    // ShaderConfig::shadow: the shadow uniforms and vs_shadow
-  bool shadowReceive : 1 = false; // shadow_receives: group 2 uses the shadow layout
+  uint64_t id = 0;
 };
 struct BindGroupRanges {
   std::array<gfx::Range, MaxIndexAttr> vaRanges{};
 };
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept;
-wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
-                                    wgpu::ShaderModule shader, const char* label) noexcept;
+// GL: build_pipeline links the program + bakes fixed-function state (Phase 3). build_shader
+// compiles a GLSL program and returns its GL name (0 = failure).
+gl::Pipeline build_pipeline(const PipelineConfig& config, uint32_t program, const char* label) noexcept;
 std::string build_shader_source(const ShaderConfig& config) noexcept;
-wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept;
-// Shader debugging (MP_WGSL_DUMP / MP_WGSL_OVERRIDE, console `shader`). dump_shaders writes every module built so
-// far to dir (and keeps writing new ones) and returns how many files it made; set_shader_override_dir turns the
-// override on (empty = off).
-u32 dump_shaders(const char* dir) noexcept;
-void set_shader_override_dir(const char* dir) noexcept;
-// While on, each draw with a nonzero serial records the hash of its ShaderConfig; draw_shader_hash reads it back (0 =
-// none) and shader_overridden says whether an edited source is in place for a hash.
-void set_draw_shader_log(bool on) noexcept;
-void note_draw_shader(u32 serial, const ShaderConfig& config) noexcept;
-u64 draw_shader_hash(u32 serial) noexcept;
-bool shader_overridden(u64 hash) noexcept;
+uint32_t build_shader(const ShaderConfig& config) noexcept;
+// Distinct-GLSL-program count (the dedup denominator) and teardown for the build_shader program
+// cache, which shares one linked GL program across pipelines that differ only in fixed-function
+// state. The programs live with the GL context, so this only drops the lookup table.
+size_t shader_program_count() noexcept;
+void clear_shader_program_cache() noexcept;
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept;
 
 u8 comp_type_size(GXAttr attr, GXCompType type) noexcept;

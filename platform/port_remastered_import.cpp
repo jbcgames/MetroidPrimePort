@@ -1,5 +1,6 @@
 #include "port_env.h"
 #include "port_remastered_import.h"
+#include <aurora/aurora.h>
 
 #include <algorithm>
 #include <array>

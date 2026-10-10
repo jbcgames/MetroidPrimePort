@@ -3086,7 +3086,9 @@ bool Writer::Grid(const RoomPak& rp, const Vec3& shift, const std::vector<Vec3>&
     // Each layer of the lender's block, where the room lacks that layer's block (layers 2..5
     // are 128 wide, so their block holds two of layer 0's).
     std::set<GridKey> taken;
-    for (const auto& [lender, holes] : lenders) {
+    for (const auto& lenderPair : lenders) {
+      auto lender = lenderPair.first;
+      const auto& holes = lenderPair.second;
       std::vector<uint8_t> od;
       if (!ltpb(*lender, od)) {
         continue;

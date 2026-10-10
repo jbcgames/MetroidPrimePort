@@ -605,6 +605,14 @@ void RunGpuSelfTestIfRequested();
 // frame, after Aurora begins the frame and before it ends it.
 void DrawUI();
 
+// Master volume settings (persisted in port_settings.ini, defaults to 70%)
+int SfxVolume();
+int MusicVolume();
+bool HasSfxVolume();
+bool HasMusicVolume();
+void SetSfxVolume(int pct);
+void SetMusicVolume(int pct);
+
 } // namespace PortDebug
 
 #endif // METROID_PRIME_PORT_PORT_DEBUG_H

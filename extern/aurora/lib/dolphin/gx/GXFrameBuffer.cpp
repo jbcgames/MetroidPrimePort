@@ -3,16 +3,10 @@
 
 #include "../../gfx/tex_copy_conv.hpp"
 #include "../../gfx/texture.hpp"
-#include "../../gfx/recording.hpp"
-#include "../../gfx/probe.hpp"
 #include "../../window.hpp"
 #include "../../gfx/clear.hpp"
 #include "../../webgpu/gpu.hpp"
-#include "../../gx/texture.hpp"
 #include "../vi/vi_internal.hpp"
-
-#include <cstdio>
-#include <cstdlib>
 
 #include <algorithm>
 #include <cmath>
@@ -49,30 +43,20 @@ void copy_tex(const void* dest, GXBool clear) noexcept {
       .height = dstHeight,
       .format = texCopyFmt,
   };
-  static u64 s_copySerial = 0;
   auto it = g_gxState.copyTextureCache.find(key);
   if (it == g_gxState.copyTextureCache.end()) {
-    // Enough sizes for a few fog volumes' chunks (full, last column, last row, corner) in a frame.
-    constexpr size_t kSizesPerDest = 16;
-    trim_copy_sizes(dest, kSizesPerDest - 1);
     gfx::TextureHandle handle;
     if (gfx::tex_copy_conv::needs_conversion(texCopyFmt)) {
       handle = gfx::new_conv_texture(dstWidth, dstHeight, texCopyFmt, "Copy Conv Texture");
     } else {
       // Configure the texture swizzle to use alpha 1.0 if targeting RGB565 or EFB doesn't have alpha
-      const auto fmt =
-          texCopyFmt == GX_TF_RGB565 || g_gxState.pixelFmt == GX_PF_RGB8_Z24 || g_gxState.pixelFmt == GX_PF_RGB565_Z16
-              ? GX_TF_RGB565
-              : GX_TF_RGBA8;
+      const auto fmt = texCopyFmt == GX_TF_RGB565 || g_gxState.pixelFmt == GX_PF_RGB8_Z24 ||
+                               g_gxState.pixelFmt == GX_PF_RGB565_Z16
+                           ? GX_TF_RGB565
+                           : GX_TF_RGBA8;
       handle = gfx::new_render_texture(dstWidth, dstHeight, fmt, "Resolved Texture");
     }
     it = g_gxState.copyTextureCache.emplace(key, GXState::CopyTextureRef{.handle = handle, .revision = 0}).first;
-    static const bool logNew = std::getenv("MP_LOG_COPY_TEX") != nullptr;
-    if (logNew) {
-      std::fprintf(stderr, "[copytex] new %p %ux%u (logical %ux%u) fmt %u, %zu cached\n", dest, dstWidth, dstHeight,
-                   g_gxState.texCopyDstWidth, g_gxState.texCopyDstHeight, static_cast<unsigned>(texCopyFmt),
-                   g_gxState.copyTextureCache.size());
-    }
   }
   auto& handle = it->second;
 
@@ -83,31 +67,21 @@ void copy_tex(const void* dest, GXBool clear) noexcept {
     }
     // Overwrite alpha before resolving
     gfx::push_draw_command(gfx::clear::DrawData{
-        .pipeline =
-            gfx::pipeline_ref(gfx::clear::make_pipeline_config(gfx::get_render_target_layout(), false, true, false)),
-        .color = wgpu::Color{0.f, 0.f, 0.f, g_gxState.dstAlpha / 255.f},
+        .pipeline = gfx::pipeline_ref(gfx::clear::PipelineConfig{
+            .clearColor = false,
+            .clearAlpha = true,
+            .clearDepth = false,
+        }),
+        .color = gl::Color{0.f, 0.f, 0.f, g_gxState.dstAlpha / 255.f},
     });
   }
   const auto clearColor = clear && g_gxState.colorUpdate;
   const auto clearAlpha = clear && g_gxState.alphaUpdate;
   const auto clearDepth = clear && g_gxState.depthUpdate;
-  // Cost test 11 measures what the copies' pass breaks cost; a copy that clears still has to.
-  if (clear || GXGetPBRCostTest() != 11) {
-    gfx::resolve_pass_into(handle.handle, rect, clearColor, clearAlpha, clearDepth, g_gxState.clearColor,
-                           clear_depth_value(), texCopyFmt);
-  }
+  gfx::resolve_pass_into(handle.handle, rect, clearColor, clearAlpha, clearDepth, g_gxState.clearColor,
+                         clear_depth_value(), texCopyFmt);
   ++handle.revision;
-  handle.lastCopy = ++s_copySerial;
-  handle.width = g_gxState.texCopyDstWidth;
-  handle.height = g_gxState.texCopyDstHeight;
   g_gxState.copyTextures[dest] = handle;
-  texture::invalidate_bindings();
-}
-
-void copy_probe_face(u32 face) noexcept {
-  const auto rect = map_logical_scissor(g_gxState.texCopySrc);
-  gfx::resolve_pass_into(gfx::probe::face(face), rect, true, true, true, g_gxState.clearColor, clear_depth_value(),
-                         GX_TF_RGBA8, static_cast<int>(face % 6));
 }
 } // namespace aurora::gx
 
@@ -174,17 +148,11 @@ GXRenderModeObj GXMpal480IntDf = {
 };
 
 void GXAdjustForOverscan(GXRenderModeObj* rmin, GXRenderModeObj* rmout, u16 hor, u16 ver) {
-  // Overscan only insets the visible VI area; the EFB and XFB keep the game's
-  // logical size, because they drive GXSetViewport and GXSetScissor. The GX
-  // scissor is a 12-bit field biased by 342 (width <= 3754), so copying the OS window's pixel
-  // size into fbWidth (2351, or 1878 once the port widens it to 16:9) wraps the
-  // scissor to zero width and clips every draw away. Aurora scales the logical
-  // framebuffer up to the window when it presents instead.
   *rmout = *rmin;
-  rmout->viXOrigin = static_cast< u16 >(rmin->viXOrigin + hor);
-  rmout->viYOrigin = static_cast< u16 >(rmin->viYOrigin + ver);
-  rmout->viWidth = static_cast< u16 >(rmin->viWidth - 2 * hor);
-  rmout->viHeight = static_cast< u16 >(rmin->viHeight - 2 * ver);
+  const auto size = aurora::window::get_window_size();
+  rmout->fbWidth = size.fb_width;
+  rmout->efbHeight = size.fb_height;
+  rmout->xfbHeight = size.fb_height;
 }
 
 void GXSetDispCopySrc(u16 left, u16 top, u16 wd, u16 ht) {}
@@ -241,13 +209,7 @@ void GXSetDispCopyGamma(GXGamma gamma) {}
 
 void GXCopyDisp(void* dest, GXBool clear) {}
 
-// Port extension: counts EFB copies made from the game thread (GXPortCopySerial).
-static u32 sCopySerial = 0;
-
-u32 GXPortCopySerial(void) { return sCopySerial; }
-
 void GXCopyTex(void* dest, GXBool clear) {
-  ++sCopySerial;
   GX_WRITE_AURORA(GX_AURORA_LOAD_COPY_DEST);
   GX_WRITE_U64(reinterpret_cast<u64>(dest));
 
@@ -255,7 +217,6 @@ void GXCopyTex(void* dest, GXBool clear) {
   SET_REG_FIELD(0, __gx->cpTex, 1, 14, 0);
   SET_REG_FIELD(0, __gx->cpTex, 8, 24, 0x52);
   GX_WRITE_RAS_REG(__gx->cpTex);
-  aurora::gx::fifo::publish();
 }
 
 // TODO GXGetYScaleFactor

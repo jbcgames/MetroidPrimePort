@@ -13,11 +13,8 @@ function(aurora_copy_runtime_dlls target)
   # Copy TARGET_RUNTIME_DLLS for each target
   foreach (_t IN ITEMS ${target} ${ARGN})
     add_custom_command(TARGET ${target} POST_BUILD
-        COMMAND ${CMAKE_COMMAND}
-          "-DRUNTIME_DLLS=$<TARGET_RUNTIME_DLLS:${_t}>"
-          "-DDESTINATION=$<TARGET_FILE_DIR:${target}>"
-          -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/CopyRuntimeDLLs.cmake"
-        VERBATIM
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:${_t}> $<TARGET_FILE_DIR:${target}>
+        COMMAND_EXPAND_LISTS
     )
   endforeach ()
 

@@ -46,3 +46,5 @@ android/*.keystore
 /AGENTS.md
 /CLAUDE.md
 /STATUS.md
+config.log
+extern/aurora_bad/

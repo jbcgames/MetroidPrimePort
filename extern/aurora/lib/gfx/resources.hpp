@@ -10,35 +10,6 @@ inline constexpr uint64_t IndexBufferSize = 2097152;    // 2 MiB
 inline constexpr uint64_t StorageBufferSize = 8388608;  // 8 MiB
 inline constexpr uint64_t TextureUploadSize = 25165824; // 24 MiB
 
-// What a frame can hold of each kind of data. The constants above are the sizes at
-// AuroraConfig::frameBufferScale 1; initialize() fixes the sizes in use for the run.
-struct FrameBufferSizes {
-  uint64_t vertex = VertexBufferSize;
-  uint64_t uniform = UniformBufferSize;
-  uint64_t index = IndexBufferSize;
-  uint64_t storage = StorageBufferSize;
-
-  // Kept across frames (AuroraConfig::residentGeometryMiB): the device buffers hold these
-  // after what a frame holds, and no staging buffer does.
-  uint64_t residentVertex = 0;
-  uint64_t residentIndex = 0;
-  uint64_t residentStorage = 0;
-
-  uint64_t staging() const noexcept {
-    return vertex + uniform + index + storage + (UseTextureBuffer ? TextureUploadSize : 0);
-  }
-};
-const FrameBufferSizes& frame_buffer_sizes() noexcept;
-
-enum class ResidentBuffer : uint8_t { Vertex, Index, Storage };
-// The part of a shared buffer kept across frames, as offsets into that buffer; size 0
-// when there is none.
-Range resident_region(ResidentBuffer kind) noexcept;
-// Copies `size` bytes into a resident region at `offset` (an offset into the buffer, as
-// resident_region gives), before the pass being recorded draws. False outside a frame's
-// recording, where nothing is copied.
-bool queue_resident_upload(ResidentBuffer kind, uint32_t offset, const uint8_t* data, size_t size);
-
 namespace detail {
 struct Resources {
   wgpu::Buffer vertexBuffer;

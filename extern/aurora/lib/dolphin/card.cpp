@@ -1,9 +1,7 @@
 #include "dolphin/card.h"
 
-#include <cstring>
 #include <filesystem>
 
-#include "aurora/card.h"
 #include "../internal.hpp"
 #include "dolphin/types.h"
 
@@ -20,12 +18,8 @@ std::array<std::filesystem::path, 2> cardPaths;
 
 constexpr uint16_t CARD_SECTOR_SIZE = 8192;
 
-const char* get_card_region(const char* gameName) {
-  // SDK game IDs are four bytes and need not have a trailing NUL (g_gameName).
-  if (gameName == nullptr) {
-    return nullptr;
-  }
-  switch (gameName[3]) {
+const char* GetCardRegion() {
+  switch (aurora::g_gameName[3]) {
   case 'E':
   default:
     return "USA";
@@ -38,18 +32,12 @@ const char* get_card_region(const char* gameName) {
 
 #define GET_CARD(slot) CardChannels[slot]
 #define CARD_USE_GCI_FOLDER SelectedFileType == CARD_GCIFOLDER
-#define CARD_READY(slot) card_ready(slot)
+#define CARD_READY(slot) (CARD_USE_GCI_FOLDER ? true : std::filesystem::exists(CardChannels[slot]->cardFilename()))
 #define CARD_STUB Log.debug("{} is stubbed.", __FUNCTION__);
 
 bool Initialized = false;
 CARDFileType SelectedFileType = CARD_GCIFOLDER;
 bool UseFastMode = false;
-
-bool card_ready(s32 slot) {
-  if (!Initialized || CardChannels[slot] == nullptr || cardPaths[slot].empty()) return false;
-  std::error_code error;
-  return std::filesystem::exists(cardPaths[slot], error);
-}
 
 void CopyKabuFileHandleToDolphin(const s32 chan, const aurora::card::FileHandle& handle, CARDFileInfo* fileInfo) {
   fileInfo->chan = chan;
@@ -61,180 +49,20 @@ aurora::card::FileHandle CreateKabuFileHandleFromDolphin(const CARDFileInfo* fil
   return aurora::card::FileHandle{static_cast<u32>(fileInfo->fileNo), fileInfo->offset};
 }
 
-std::filesystem::path get_card_full_path(const std::filesystem::path& path, const char* gameName,
-                                         const AuroraCardType type, const aurora::card::ECardSlot slot) {
+std::filesystem::path GetCardFullPath(const std::filesystem::path& path, const aurora::card::ECardSlot slot) {
   if (path.empty())
     return "";
 
-  const char* region = get_card_region(gameName);
-  if (region == nullptr) {
-    return "";
-  }
-  if (type == AURORA_CARD_GCI_DIRECTORY) {
-    return path / region / (slot == aurora::card::ECardSlot::SlotA ? "Card A" : "Card B");
+  if (CARD_USE_GCI_FOLDER) {
+    return path / GetCardRegion() / (slot == aurora::card::ECardSlot::SlotA ? "Card A" : "Card B");
   } else {
-    return path / fmt::format("MemoryCard{}.{}.raw", slot == aurora::card::ECardSlot::SlotA ? "A" : "B", region);
+    return path /
+           fmt::format("MemoryCard{}.{}.raw", slot == aurora::card::ECardSlot::SlotA ? "A" : "B", GetCardRegion());
   }
-}
-
-AuroraCardType selected_card_type() { return CARD_USE_GCI_FOLDER ? AURORA_CARD_GCI_DIRECTORY : AURORA_CARD_RAW_IMAGE; }
-
-size_t copy_path(const std::filesystem::path& path, char* buffer, const size_t capacity) {
-  if (buffer != nullptr && capacity != 0) {
-    buffer[0] = '\0';
-  }
-  if (path.empty()) {
-    return 0;
-  }
-  const auto pathString = aurora::io::fs_path_to_string(path);
-  const size_t required = pathString.size() + 1;
-  if (buffer == nullptr || capacity < required) {
-    return required;
-  }
-  std::memcpy(buffer, pathString.c_str(), required);
-  return required;
 }
 } // namespace
 
 extern "C" {
-
-AuroraCardType aurora_card_get_type(const s32 channel) {
-  if (!Initialized || channel < 0 || channel >= static_cast<s32>(cardPaths.size()) || cardPaths[channel].empty()) {
-    return AURORA_CARD_UNAVAILABLE;
-  }
-  return CARD_USE_GCI_FOLDER ? AURORA_CARD_GCI_DIRECTORY : AURORA_CARD_RAW_IMAGE;
-}
-
-size_t aurora_card_get_path(const char* gameName, const AuroraCardType type, const s32 channel, char* buffer,
-                            const size_t capacity) {
-  if (buffer != nullptr && capacity != 0) {
-    buffer[0] = '\0';
-  }
-  if (channel < 0 || channel >= static_cast<s32>(cardPaths.size()) ||
-      (type != AURORA_CARD_GCI_DIRECTORY && type != AURORA_CARD_RAW_IMAGE)) {
-    return 0;
-  }
-  if (aurora_card_get_type(channel) == type) {
-    return copy_path(cardPaths[channel], buffer, capacity);
-  }
-
-  std::filesystem::path basePath;
-  if (aurora::g_config.userPath != nullptr) {
-    basePath = aurora::io::fs_path_from_string(aurora::g_config.userPath);
-  } else {
-    basePath = std::filesystem::current_path();
-  }
-  return copy_path(get_card_full_path(basePath, gameName, type, static_cast<aurora::card::ECardSlot>(channel)), buffer,
-                   capacity);
-}
-
-bool aurora_card_remount(const s32 channel) {
-  if (!Initialized || channel < 0 || channel >= static_cast<s32>(CardChannels.size()) ||
-      CardChannels[channel] == nullptr || cardPaths[channel].empty()) {
-    return false;
-  }
-  CardChannels[channel]->close();
-  return CardChannels[channel]->open(cardPaths[channel]);
-}
-
-bool aurora_card_set_base_path(const char* path) {
-  if (!Initialized || path == nullptr || path[0] == '\0') {
-    return false;
-  }
-  const auto base = aurora::io::fs_path_from_string(path);
-  bool loadedCard = false;
-  for (int i = 0; i < 2; ++i) {
-    if (CardChannels[i] == nullptr) {
-      continue;
-    }
-    CardChannels[i]->close();
-    cardPaths[i] =
-        get_card_full_path(base, aurora::g_gameName, selected_card_type(), static_cast<aurora::card::ECardSlot>(i));
-    std::error_code ec;
-    if (!cardPaths[i].empty() && std::filesystem::exists(cardPaths[i], ec) && CardChannels[i]->open(cardPaths[i])) {
-      loadedCard = true;
-    }
-  }
-  std::error_code createError;
-  if (!loadedCard && CardChannels[0] != nullptr && !cardPaths[0].empty() &&
-      !std::filesystem::exists(cardPaths[0], createError) && !createError) {
-    CardChannels[0]->open(cardPaths[0]);
-    CardChannels[0]->format(aurora::card::ECardSlot::SlotA);
-    CardChannels[0]->close();
-    CardChannels[0]->open(cardPaths[0]);
-  }
-  Log.info("Card base moved to: {}", aurora::io::fs_path_to_string(base));
-  return card_ready(0);
-}
-
-bool aurora_card_raw_list(const char* imagePath, const char* game, const char* maker,
-                          void (*visit)(const char* fileName, void* userData), void* userData) {
-  if (imagePath == nullptr || game == nullptr || std::strlen(game) != 4 || maker == nullptr ||
-      std::strlen(maker) != 2 || visit == nullptr) {
-    return false;
-  }
-  aurora::card::CardRawFile card;
-  card.InitCard(game, maker);
-  if (!card.open(aurora::io::fs_path_from_string(imagePath)) || card.getError() != aurora::card::ECardResult::READY) {
-    return false;
-  }
-  for (auto handle = card.firstFile(); handle; handle = card.nextFile(handle)) {
-    char fileName[33]{};
-    std::memcpy(fileName, card.getFilename(handle), 32);
-    visit(fileName, userData);
-  }
-  return true;
-}
-
-size_t aurora_card_raw_extract(const char* imagePath, const char* game, const char* maker, const char* fileName,
-                               void* gciOut, const size_t capacity) {
-  if (imagePath == nullptr || game == nullptr || maker == nullptr || fileName == nullptr) {
-    return 0;
-  }
-  aurora::card::CardRawFile card;
-  card.InitCard(game, maker);
-  if (!card.open(aurora::io::fs_path_from_string(imagePath)) || card.getError() != aurora::card::ECardResult::READY) {
-    return 0;
-  }
-  return card.extractGci(fileName, gciOut, capacity);
-}
-
-bool aurora_card_raw_insert(const char* imagePath, const void* gci, const size_t size, const bool replace) {
-  if (imagePath == nullptr) {
-    return false;
-  }
-  aurora::card::CardRawFile card;
-  const auto path = aurora::io::fs_path_from_string(imagePath);
-  if (!card.open(path)) {
-    if (std::filesystem::exists(path)) {
-      return false;
-    }
-    if (card.format(aurora::card::ECardSlot::SlotA) != aurora::card::ECardResult::READY) {
-      return false;
-    }
-    card.close();
-    if (!card.open(path)) {
-      return false;
-    }
-  }
-  if (card.getError() != aurora::card::ECardResult::READY) {
-    return false;
-  }
-  return card.insertGci(gci, size, replace);
-}
-
-bool aurora_card_raw_delete(const char* imagePath, const char* game, const char* maker, const char* fileName) {
-  if (imagePath == nullptr || game == nullptr || maker == nullptr || fileName == nullptr) {
-    return false;
-  }
-  aurora::card::CardRawFile card;
-  card.InitCard(game, maker);
-  if (!card.open(aurora::io::fs_path_from_string(imagePath)) || card.getError() != aurora::card::ECardResult::READY ||
-      card.deleteFile(fileName) != aurora::card::ECardResult::READY) {
-    return false;
-  }
-  return card.commit() == aurora::card::ECardResult::READY;
-}
 
 void CopyKabuStatsToDolphin(const aurora::card::CardStat& kabuStats, CARDStat* stats) {
   memcpy(stats->fileName, kabuStats.x0_fileName, std::size(kabuStats.x0_fileName));
@@ -280,18 +108,18 @@ void CARDDetectDolphin(const s32 chan) {
   }
 
   if (chan == 0 || chan == 1) {
-    cardPaths[chan] = aurora::card::ResolveDolphinCardPath(static_cast<aurora::card::ECardSlot>(chan),
-                                                           get_card_region(aurora::g_gameName), CARD_USE_GCI_FOLDER);
+    cardPaths[chan] = aurora::card::ResolveDolphinCardPath(static_cast<aurora::card::ECardSlot>(chan), GetCardRegion(),
+                                                           CARD_USE_GCI_FOLDER);
     if (cardPaths[chan].empty()) {
       Log.error("Failed to detect Dolphin Card!");
       return;
     }
     Log.info("Detected Dolphin Card at: {}", aurora::io::fs_path_to_string(cardPaths[chan]));
   } else {
-    cardPaths[0] = aurora::card::ResolveDolphinCardPath(aurora::card::ECardSlot::SlotA,
-                                                        get_card_region(aurora::g_gameName), CARD_USE_GCI_FOLDER);
-    cardPaths[1] = aurora::card::ResolveDolphinCardPath(aurora::card::ECardSlot::SlotB,
-                                                        get_card_region(aurora::g_gameName), CARD_USE_GCI_FOLDER);
+    cardPaths[0] =
+        aurora::card::ResolveDolphinCardPath(aurora::card::ECardSlot::SlotA, GetCardRegion(), CARD_USE_GCI_FOLDER);
+    cardPaths[1] =
+        aurora::card::ResolveDolphinCardPath(aurora::card::ECardSlot::SlotB, GetCardRegion(), CARD_USE_GCI_FOLDER);
 
     if (cardPaths[0].empty() && cardPaths[1].empty()) {
       Log.error("Failed to detect Dolphin Card!");
@@ -316,13 +144,10 @@ void CARDSetBasePath(const char* path, const s32 chan) {
   }
 
   if (chan == 0 || chan == 1) {
-    cardPaths[chan] = get_card_full_path(filePath, aurora::g_gameName, selected_card_type(),
-                                         static_cast<aurora::card::ECardSlot>(chan));
+    cardPaths[chan] = GetCardFullPath(filePath, static_cast<aurora::card::ECardSlot>(chan));
   } else {
-    cardPaths[0] =
-        get_card_full_path(filePath, aurora::g_gameName, selected_card_type(), aurora::card::ECardSlot::SlotA);
-    cardPaths[1] =
-        get_card_full_path(filePath, aurora::g_gameName, selected_card_type(), aurora::card::ECardSlot::SlotB);
+    cardPaths[0] = GetCardFullPath(filePath, aurora::card::ECardSlot::SlotA);
+    cardPaths[1] = GetCardFullPath(filePath, aurora::card::ECardSlot::SlotB);
   }
 }
 
@@ -358,8 +183,7 @@ void CARDInit(const char* game, const char* maker) {
   for (int i = 0; i < 2; ++i) {
     // use default working directory if no path was supplied for card
     if (cardPaths[i].empty()) {
-      cardPaths[i] =
-          get_card_full_path(cardWorkingDir, game, selected_card_type(), static_cast<aurora::card::ECardSlot>(i));
+      cardPaths[i] = GetCardFullPath(cardWorkingDir, static_cast<aurora::card::ECardSlot>(i));
     }
 
     const auto& curPath = cardPaths[i];
@@ -375,8 +199,8 @@ void CARDInit(const char* game, const char* maker) {
     }
   }
 
-  std::error_code createError;
-  if (!loadedCard && !std::filesystem::exists(cardPaths[0], createError) && !createError) {
+  // create a SlotA card if no cards were loaded
+  if (!loadedCard) {
     CardChannels[0]->open(cardPaths[0]);
     CardChannels[0]->format(aurora::card::ECardSlot::SlotA);
     CardChannels[0]->close();
@@ -423,7 +247,9 @@ s32 CARDCheckAsync(const s32 chan, const CARDCallback callback) {
 
   const auto& card = GET_CARD(chan);
   const auto res = static_cast<s32>(card->getError());
-  if (callback != nullptr) callback(chan, res);
+  if (callback) {
+    callback(chan, res);
+  }
   return static_cast<s32>(card->getError());
 }
 
@@ -443,10 +269,11 @@ s32 CARDCheckExAsync(const s32 chan, s32* xferBytes [[maybe_unused]], const CARD
   if (chan < 0 || chan >= 2) {
     return CARD_RESULT_FATAL_ERROR;
   }
-  if (!CARD_READY(chan)) return CARD_RESULT_NOCARD;
   const auto& card = GET_CARD(chan);
   const auto res = static_cast<s32>(card->getError());
-  if (callback != nullptr) callback(chan, res);
+  if (callback) {
+    callback(chan, res);
+  }
   return static_cast<s32>(card->getError());
 }
 
@@ -462,7 +289,7 @@ s32 CARDCreate(const s32 chan, const char* fileName, const u32 size, CARDFileInf
   auto res = card->createFile(fileName, size, handle);
   if (res == aurora::card::ECardResult::READY) {
     CopyKabuFileHandleToDolphin(chan, handle, fileInfo);
-    res = card->commit();
+    card->commit();
   } else
     Log.error("Failed to create file: {}", fileName);
 
@@ -475,7 +302,9 @@ s32 CARDCreateAsync(const s32 chan, const char* fileName, const u32 size, CARDFi
     return CARD_RESULT_FATAL_ERROR;
   }
   const auto res = CARDCreate(chan, fileName, size, fileInfo);
-  if (callback != nullptr) callback(chan, res);
+  if (callback) {
+    callback(chan, res);
+  }
   return res;
 }
 
@@ -487,12 +316,12 @@ s32 CARDDelete(const s32 chan, const char* fileName) {
     return CARD_RESULT_NOCARD;
 
   const auto& card = GET_CARD(chan);
-  auto res = card->deleteFile(fileName);
+  const auto res = card->deleteFile(fileName);
 
-  if (res != aurora::card::ECardResult::READY) {
+  if (res != aurora::card::ECardResult::READY && res != aurora::card::ECardResult::NOFILE) {
     Log.error("Failed to delete file: {}", fileName);
   } else {
-    res = card->commit();
+    card->commit();
   }
 
   return static_cast<s32>(res);
@@ -503,7 +332,9 @@ s32 CARDDeleteAsync(const s32 chan, const char* fileName, const CARDCallback cal
     return CARD_RESULT_FATAL_ERROR;
   }
   const auto res = CARDDelete(chan, fileName);
-  if (callback != nullptr) callback(chan, res);
+  if (callback) {
+    callback(chan, res);
+  }
   return res;
 }
 
@@ -515,11 +346,11 @@ s32 CARDFastDelete(const s32 chan, const s32 fileNo) {
     return CARD_RESULT_NOCARD;
 
   const auto& card = GET_CARD(chan);
-  auto res = card->deleteFile(fileNo);
-  if (res != aurora::card::ECardResult::READY) {
+  const auto res = card->deleteFile(fileNo);
+  if (res != aurora::card::ECardResult::READY && res != aurora::card::ECardResult::NOFILE) {
     Log.error("Failed to delete file at idx: {}", fileNo);
   } else {
-    res = card->commit();
+    card->commit();
   }
 
   return static_cast<s32>(res);
@@ -530,7 +361,9 @@ s32 CARDFastDeleteAsync(const s32 chan, const s32 fileNo, const CARDCallback cal
     return CARD_RESULT_FATAL_ERROR;
   }
   const auto res = CARDFastDelete(chan, fileNo);
-  if (callback != nullptr) callback(chan, res);
+  if (callback) {
+    callback(chan, res);
+  }
   return res;
 }
 
@@ -547,7 +380,7 @@ s32 CARDFastOpen(const s32 chan, const s32 fileNo, CARDFileInfo* fileInfo) {
   const auto res = card->openFile(fileNo, handle);
   if (res == aurora::card::ECardResult::READY)
     CopyKabuFileHandleToDolphin(chan, handle, fileInfo);
-  else
+  else if (res != aurora::card::ECardResult::NOFILE)
     Log.error("Failed to open file at idx: {}", fileNo);
 
   return static_cast<s32>(res);
@@ -561,7 +394,9 @@ s32 CARDFormat(s32 chan) {
     return CARD_RESULT_NOCARD;
 
   const auto& card = GET_CARD(chan);
-  return static_cast<s32>(card->format(static_cast<aurora::card::ECardSlot>(chan)));
+  card->format(static_cast<aurora::card::ECardSlot>(chan));
+  card->commit();
+  return CARD_RESULT_READY;
 }
 
 s32 CARDFormatAsync(const s32 chan, const CARDCallback callback) {
@@ -569,7 +404,9 @@ s32 CARDFormatAsync(const s32 chan, const CARDCallback callback) {
     return CARD_RESULT_FATAL_ERROR;
   }
   const auto res = CARDFormat(chan);
-  if (callback != nullptr) callback(chan, res);
+  if (callback) {
+    callback(chan, res);
+  }
   return res;
 }
 
@@ -692,16 +529,17 @@ s32 CARDMount(const s32 chan, void* workArea [[maybe_unused]], CARDCallback deta
     return CARD_RESULT_FATAL_ERROR;
   }
 
-  return CARD_READY(chan) ? CARD_RESULT_READY : CARD_RESULT_NOCARD;
+  return CARD_RESULT_READY;
 }
 s32 CARDMountAsync(const s32 chan, void* workArea [[maybe_unused]], const CARDCallback detachCallback [[maybe_unused]],
                    const CARDCallback attachCallback [[maybe_unused]]) {
   if (chan < 0 || chan >= 2) {
     return CARD_RESULT_FATAL_ERROR;
   }
-  const s32 result = CARDMount(chan, workArea, detachCallback);
-  if (attachCallback != nullptr) attachCallback(chan, result);
-  return result;
+  if (attachCallback) {
+    attachCallback(chan, CARD_RESULT_READY);
+  }
+  return CARD_RESULT_READY;
 }
 
 s32 CARDOpen(const s32 chan, const char* fileName, CARDFileInfo* fileInfo) {
@@ -716,7 +554,7 @@ s32 CARDOpen(const s32 chan, const char* fileName, CARDFileInfo* fileInfo) {
   const auto res = card->openFile(fileName, handle);
   if (res == aurora::card::ECardResult::READY)
     CopyKabuFileHandleToDolphin(chan, handle, fileInfo);
-  else
+  else if (res != aurora::card::ECardResult::NOFILE)
     Log.error("Failed to open file: {}", fileName);
 
   return static_cast<s32>(res);
@@ -724,9 +562,8 @@ s32 CARDOpen(const s32 chan, const char* fileName, CARDFileInfo* fileInfo) {
 
 BOOL CARDProbe(const s32 chan) {
   if (chan < 0 || chan >= 2) {
-    return FALSE;
+    return CARD_RESULT_FATAL_ERROR;
   }
-  if (!Initialized || GET_CARD(chan) == nullptr) return FALSE;
   const auto& card = GET_CARD(chan);
 
   aurora::card::ProbeResults probeData = card->probeCardFile(cardPaths[chan]);
@@ -737,7 +574,6 @@ s32 CARDProbeEx(const s32 chan, s32* memSize, s32* sectorSize) {
   if (chan < 0 || chan >= 2) {
     return CARD_RESULT_FATAL_ERROR;
   }
-  if (!Initialized || GET_CARD(chan) == nullptr) return CARD_RESULT_NOCARD;
   const auto& card = GET_CARD(chan);
 
   // ReSharper disable once CppUseStructuredBinding
@@ -756,8 +592,7 @@ s32 CARDRename(const s32 chan, const char* oldName, const char* newName) {
     return CARD_RESULT_NOCARD;
   const auto& card = GET_CARD(chan);
 
-  const auto res = card->renameFile(oldName, newName);
-  return static_cast<s32>(res == aurora::card::ECardResult::READY ? card->commit() : res);
+  return static_cast<s32>(card->renameFile(oldName, newName));
 }
 
 s32 CARDRenameAsync(const s32 chan, const char* oldName, const char* newName, const CARDCallback callback) {
@@ -765,7 +600,9 @@ s32 CARDRenameAsync(const s32 chan, const char* oldName, const char* newName, co
     return CARD_RESULT_FATAL_ERROR;
   }
   const auto res = CARDRename(chan, oldName, newName);
-  if (callback != nullptr) callback(chan, res);
+  if (callback) {
+    callback(chan, res);
+  }
   return res;
 }
 
@@ -776,6 +613,9 @@ s32 CARDSetAttributesAsync(const s32 chan, s32 fileNo [[maybe_unused]], u8 attr 
   }
   // TODO:
   CARD_STUB
+  if (callback) {
+    callback(chan, CARD_RESULT_READY);
+  }
   return CARD_RESULT_READY;
 }
 
@@ -802,7 +642,7 @@ s32 CARDSetStatus(const s32 chan, s32 fileNo, const CARDStat* stat) {
   if (res != aurora::card::ECardResult::READY) {
     Log.error("Failed to set status of file at idx: {}", fileNo);
   } else {
-    res = card->commit();
+    card->commit();
   }
 
   return static_cast<s32>(res);
@@ -822,7 +662,9 @@ s32 CARDSetStatusAsync(const s32 chan, const s32 fileNo, const CARDStat* stat, c
     return CARD_RESULT_FATAL_ERROR;
   }
   const auto res = CARDSetStatus(chan, fileNo, stat);
-  if (callback != nullptr) callback(chan, res);
+  if (callback) {
+    callback(chan, res);
+  }
   return res;
 }
 
@@ -830,10 +672,8 @@ s32 CARDUnmount(const s32 chan) {
   if (chan < 0 || chan >= 2) {
     return CARD_RESULT_FATAL_ERROR;
   }
-  if (!CARD_READY(chan)) return CARD_RESULT_NOCARD;
-  // Aurora retains the backing store; the SDK client can now release its work
-  // area and later mount again. Persist changes before reporting completion.
-  return static_cast<s32>(GET_CARD(chan)->commit());
+  // TODO:
+  return CARD_RESULT_NOCARD;
 }
 
 s32 CARDGetCurrentMode(const s32 chan, u32* mode [[maybe_unused]]) {
@@ -867,7 +707,6 @@ s32 CARDClose(CARDFileInfo* fileInfo) {
 }
 
 s32 CARDRead(const CARDFileInfo* fileInfo, void* addr, s32 length, const s32 offset) {
-  if (fileInfo == nullptr || addr == nullptr || length < 0 || offset < 0) return CARD_RESULT_FATAL_ERROR;
   if (fileInfo->chan < 0 || fileInfo->chan >= 2) {
     return CARD_RESULT_FATAL_ERROR;
   }
@@ -888,14 +727,14 @@ s32 CARDRead(const CARDFileInfo* fileInfo, void* addr, s32 length, const s32 off
 
 s32 CARDReadAsync(const CARDFileInfo* fileInfo, void* addr, const s32 length, const s32 offset,
                   const CARDCallback callback) {
-  if (fileInfo == nullptr) return CARD_RESULT_FATAL_ERROR;
   const auto res = CARDRead(fileInfo, addr, length, offset);
-  if (callback != nullptr) callback(fileInfo->chan, res);
+  if (callback) {
+    callback(fileInfo->chan, res);
+  }
   return res;
 }
 
 s32 CARDWrite(const CARDFileInfo* fileInfo, const void* addr, const s32 length, const s32 offset) {
-  if (fileInfo == nullptr || addr == nullptr || length < 0 || offset < 0) return CARD_RESULT_FATAL_ERROR;
   if (fileInfo->chan < 0 || fileInfo->chan >= 2) {
     return CARD_RESULT_FATAL_ERROR;
   }
@@ -911,7 +750,7 @@ s32 CARDWrite(const CARDFileInfo* fileInfo, const void* addr, const s32 length, 
   if (res != aurora::card::ECardResult::READY) {
     Log.error("Failed to write {} bytes to card", length);
   } else {
-    res = card->commit();
+    card->commit();
   }
 
   return static_cast<s32>(res);
@@ -919,9 +758,10 @@ s32 CARDWrite(const CARDFileInfo* fileInfo, const void* addr, const s32 length, 
 
 s32 CARDWriteAsync(const CARDFileInfo* fileInfo, const void* addr, const s32 length, const s32 offset,
                    const CARDCallback callback) {
-  if (fileInfo == nullptr) return CARD_RESULT_FATAL_ERROR;
   const auto res = CARDWrite(fileInfo, addr, length, offset);
-  if (callback != nullptr) callback(fileInfo->chan, res);
+  if (callback) {
+    callback(fileInfo->chan, res);
+  }
   return res;
 }
 }

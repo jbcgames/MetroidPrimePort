@@ -33,7 +33,11 @@ static const short* curAudioBuffer;
 static int soundBufferIndex;
 static short soundBuffer[2][320] ATTRIBUTE_ALIGN(32);
 static bool sAudioEnabled = true;
+#ifdef TARGET_PC
+static uchar sSfxVolume = 90;
+#else
 static uchar sSfxVolume = 127;
+#endif
 
 struct CMoviePlayer::SIndexLoad {
   rstl::single_ptr< CDvdRequest > x0_headerRequest;
@@ -598,7 +602,12 @@ void CMoviePlayer::MixAudio(short* out, const short* in, unsigned long samples) 
     }
     return;
   }
+#ifdef TARGET_PC
+  const uchar effectiveVol = PortDebug::HasSfxVolume() ? static_cast<uchar>((PortDebug::SfxVolume() * 127 + 50) / 100) : sSfxVolume;
+  const uchar volume = rstl::min_val(127, effectiveVol * 100 >> 7);
+#else
   const uchar volume = rstl::min_val(127, sSfxVolume * 100 >> 7);
+#endif
   const ushort attenuation =
       sAudioEnabled ? static_cast< ushort >(CAudioSys::GetScaledVolume(volume)) : 0;
   for (int frame = 0; samples != 0 && frame < 3; ++frame) {
@@ -700,4 +709,12 @@ void CMoviePlayer::SetAudioEnabled(bool enabled) { sAudioEnabled = enabled; }
 
 bool CMoviePlayer::GetAudioEnabled() { return sAudioEnabled; }
 
-void CMoviePlayer::SetSfxVolume(uchar volume) { sSfxVolume = rstl::min_val(uchar(127), volume); }
+void CMoviePlayer::SetSfxVolume(uchar volume) {
+#ifdef TARGET_PC
+  if (PortDebug::HasSfxVolume()) {
+    sSfxVolume = static_cast<uchar>((PortDebug::SfxVolume() * 127 + 50) / 100);
+    return;
+  }
+#endif
+  sSfxVolume = rstl::min_val(uchar(127), volume);
+}

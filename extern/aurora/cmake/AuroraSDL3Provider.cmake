@@ -1,6 +1,19 @@
 include_guard(GLOBAL)
 include("${CMAKE_CURRENT_LIST_DIR}/AuroraTargetPlatform.cmake")
 
+if (EXISTS "/home/jbc/sdl3-shim/libSDL3.so")
+  if (NOT TARGET SDL3::SDL3)
+    add_library(SDL3::SDL3 SHARED IMPORTED GLOBAL)
+    set_target_properties(SDL3::SDL3 PROPERTIES
+      IMPORTED_LOCATION "/home/jbc/sdl3-shim/libSDL3.so"
+      INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_BINARY_DIR}/_deps/sdl-src/include"
+    )
+  endif ()
+  set(AURORA_SDL3_TARGET SDL3::SDL3 CACHE INTERNAL "" FORCE)
+  message(STATUS "aurora: Using bmdhacks SDL3-over-SDL2 shim from /home/jbc/sdl3-shim/libSDL3.so")
+  return()
+endif ()
+
 # Resolve SDL3 dependency based on AURORA_SDL3_PROVIDER and AURORA_SDL3_LINKAGE.
 #
 # After this module runs, the variable AURORA_SDL3_TARGET is set to the
@@ -145,12 +158,6 @@ elseif (_aurora_sdl3_provider STREQUAL "vendor")
       PATCH_COMMAND ${CMAKE_COMMAND}
         -DSDL_SOURCE_DIR=<SOURCE_DIR>
         -P "${CMAKE_CURRENT_LIST_DIR}/patches/apply-sdl3-android-nintendo-auto-mapping.cmake"
-      COMMAND ${CMAKE_COMMAND}
-        -DSDL_SOURCE_DIR=<SOURCE_DIR>
-        -P "${CMAKE_CURRENT_LIST_DIR}/patches/apply-sdl3-android-security-exception.cmake"
-      COMMAND ${CMAKE_COMMAND}
-        -DSDL_SOURCE_DIR=<SOURCE_DIR>
-        -P "${CMAKE_CURRENT_LIST_DIR}/patches/apply-sdl3-windows-process-no-window.cmake"
       EXCLUDE_FROM_ALL
     )
     FetchContent_MakeAvailable(SDL)
@@ -162,19 +169,4 @@ elseif (_aurora_sdl3_provider STREQUAL "vendor")
 else ()
   message(FATAL_ERROR "Invalid AURORA_SDL3_PROVIDER: ${AURORA_SDL3_PROVIDER} "
     "(must be auto, vendor, system, or package)")
-endif ()
-
-if (ANDROID)
-  if (NOT _aurora_sdl3_provider STREQUAL "vendor")
-    message(FATAL_ERROR "aurora: Android builds require AURORA_SDL3_PROVIDER=vendor")
-  endif ()
-  FetchContent_GetProperties(SDL SOURCE_DIR _aurora_sdl3_source_dir)
-  set(_aurora_sdl3_java_source_dir "${_aurora_sdl3_source_dir}/android-project/app/src/main/java")
-  if (NOT IS_DIRECTORY "${_aurora_sdl3_java_source_dir}/org/libsdl/app")
-    message(FATAL_ERROR "aurora: SDL Android Java sources were not found at ${_aurora_sdl3_java_source_dir}")
-  endif ()
-  set(AURORA_SDL3_JAVA_SOURCE_DIR "${_aurora_sdl3_java_source_dir}" CACHE INTERNAL
-    "Java sources matching Aurora's pinned SDL build" FORCE)
-  set(AURORA_ANDROID_JAVA_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/../platforms/android/java" CACHE INTERNAL
-    "Aurora Android Java platform sources" FORCE)
 endif ()

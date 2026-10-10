@@ -7,12 +7,9 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
-#include <cstring>
-#include <limits>
-#include <span>
-#include <string>
 #include <type_traits>
 #include <vector>
+#include <cstring>
 
 using namespace std::string_view_literals;
 
@@ -123,7 +120,7 @@ struct uint_of_size<8> {
   using type = uint64_t;
 };
 template <size_t N>
-using uint_of_size_t = uint_of_size<N>::type;
+using uint_of_size_t = typename uint_of_size<N>::type;
 
 template <typename T>
   requires(std::is_floating_point_v<T> && requires { typename uint_of_size_t<sizeof(T)>; })
@@ -165,6 +162,9 @@ ALWAYS_INLINE constexpr auto underlying(T value) noexcept -> std::underlying_typ
 #else
 #define CHECK(cond, msg, ...) AURORA_ASSERT(cond, msg, ##__VA_ARGS__)
 #endif
+// Fork compat: our GLES-era code spells this ASSERT. Defined unconditionally,
+// unlike upstream's CHECK which is compiled out under NDEBUG.
+#define ASSERT(cond, msg, ...) AURORA_ASSERT(cond, msg, ##__VA_ARGS__)
 #define DEFAULT_FATAL(msg, ...) UNLIKELY default : FATAL(msg, ##__VA_ARGS__)
 #define TRY(cond, msg, ...)                                                                                            \
   if (!(cond))                                                                                                         \
@@ -284,9 +284,6 @@ public:
   [[nodiscard]] const uint8_t* data() const noexcept { return m_data; }
   [[nodiscard]] size_t size() const noexcept { return m_length; }
   [[nodiscard]] bool empty() const noexcept { return m_length == 0; }
-  // False when appending size bytes would grow a buffer that wraps memory it doesn't own,
-  // which aborts.
-  [[nodiscard]] bool can_append(size_t size) const noexcept { return m_owned || m_length + size <= m_capacity; }
 
   void append(const void* data, size_t size) {
     resize(m_length + size, false);
@@ -297,6 +294,14 @@ public:
   template <typename T>
   void append(const T& obj) {
     append(&obj, sizeof(T));
+  }
+
+  // Grows the buffer by size bytes left for the caller to fill.
+  [[nodiscard]] uint8_t* append_uninit(size_t size) {
+    resize(m_length + size, false);
+    uint8_t* out = m_data + m_length;
+    m_length += size;
+    return out;
   }
 
   void append_zeroes(size_t size) {
@@ -315,6 +320,7 @@ public:
   }
 
   void clear() { m_length = 0; }
+  void truncate(size_t size) noexcept { m_length = std::min(m_length, size); }
   void reserve_extra(size_t size) { resize(m_length + size, true); }
 
   ByteBuffer clone() const {
@@ -351,77 +357,5 @@ private:
     }
     m_capacity = size;
   }
-};
-
-class ByteReader {
-public:
-  explicit ByteReader(std::span<const uint8_t> data) noexcept : ByteReader{data.data(), data.size()} {}
-  ByteReader(const uint8_t* data, size_t size) noexcept : mData{data}, mSize{size} {}
-
-  static ByteReader unbounded(const void* data) noexcept {
-    return {static_cast<const uint8_t*>(data), std::numeric_limits<size_t>::max()};
-  }
-
-  [[nodiscard]] bool empty() const noexcept { return mPosition == mSize; }
-  [[nodiscard]] size_t offset() const noexcept { return mPosition; }
-  [[nodiscard]] size_t size() const noexcept { return mSize; }
-  [[nodiscard]] size_t remaining() const noexcept { return mSize - mPosition; }
-  [[nodiscard]] const uint8_t* data() const noexcept { return mData; }
-
-  template <typename T>
-    requires(std::is_arithmetic_v<T>)
-  T read() noexcept {
-    const auto bytes = take(sizeof(T));
-    return read_bits<T>(bytes.data());
-  }
-
-  template <typename T>
-    requires(std::is_arithmetic_v<T>)
-  bool try_read(T& value) noexcept {
-    std::span<const uint8_t> bytes;
-    if (!try_take(sizeof(T), bytes)) {
-      return false;
-    }
-    value = read_bits<T>(bytes.data());
-    return true;
-  }
-
-  std::span<const uint8_t> take(size_t count) noexcept {
-    AURORA_ASSERT(can_read(count), "Reader overrun: need {} bytes at offset {}, have {}", count, mPosition,
-                  remaining());
-    const std::span bytes{mData + mPosition, count};
-    mPosition += count;
-    return bytes;
-  }
-
-  bool try_take(size_t count, std::span<const uint8_t>& bytes) noexcept {
-    if (!can_read(count)) {
-      return false;
-    }
-    bytes = {mData + mPosition, count};
-    mPosition += count;
-    return true;
-  }
-
-  void skip(size_t count) noexcept {
-    AURORA_ASSERT(can_read(count), "Reader overrun: need {} bytes at offset {}, have {}", count, mPosition,
-                  remaining());
-    mPosition += count;
-  }
-
-  std::string read_string() noexcept {
-    const auto length = read<uint16_t>();
-    const auto bytes = take(length);
-    return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
-  }
-
-private:
-  static constexpr aurora::Module Log{"aurora::reader"};
-
-  [[nodiscard]] bool can_read(size_t count) const noexcept { return mPosition <= mSize && count <= mSize - mPosition; }
-
-  const uint8_t* mData;
-  size_t mSize;
-  size_t mPosition = 0;
 };
 } // namespace aurora

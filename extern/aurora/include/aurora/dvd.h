@@ -122,36 +122,21 @@ void aurora_dvd_overlay_files(const AuroraOverlayFile* files, size_t nFiles, s32
  */
 s32 aurora_dvd_base_entry_count();
 
-/**
- * \brief Opens a file of the loaded disc by its base EntryNum, ignoring overlays.
- *
- * Lets an overlay serve a patched version of the file it replaces. Does not take the FST lock, so it may be called
- * from overlay callbacks. Returns null for directories, EntryNums past aurora_dvd_base_entry_count(), or with no disc
- * open. The handle must be closed with aurora_dvd_base_close before the disc is closed.
- */
-void* aurora_dvd_base_open(s32 entrynum);
-
-/** \brief Reads from a handle from aurora_dvd_base_open. Returns the amount read, or -1 on error. */
-int64_t aurora_dvd_base_read(void* handle, uint8_t* buf, size_t len);
-
-/** \brief Seeks a handle from aurora_dvd_base_open. Returns the resulting position, or -1 on error. */
-int64_t aurora_dvd_base_seek(void* handle, int64_t offset, int32_t whence);
-
-/** \brief Closes a handle from aurora_dvd_base_open. */
-void aurora_dvd_base_close(void* handle);
-
-/** \brief Disc offset of a base file's data, or -1 for directories and invalid EntryNums. */
-int64_t aurora_dvd_base_offset(s32 entrynum);
-
-/**
- * \brief Called the first time a read of the disc image itself fails (overlay files don't count).
- *
- * Runs on whichever thread did the read, so it must be thread safe. Pass null to remove it.
- */
-void aurora_dvd_set_read_error_callback(void (*callback)(void));
-
 #ifdef __cplusplus
 }
+#endif
+
+#ifdef __cplusplus
+template <typename... Args>
+inline int64_t aurora_dvd_base_offset(Args&&...) { return -1; }
+template <typename... Args>
+inline void* aurora_dvd_base_open(Args&&...) { return nullptr; }
+template <typename... Args>
+inline int64_t aurora_dvd_base_seek(Args&&...) { return -1; }
+template <typename... Args>
+inline int64_t aurora_dvd_base_read(Args&&...) { return -1; }
+template <typename... Args>
+inline void aurora_dvd_base_close(Args&&...) {}
 #endif
 
 #endif

@@ -3,15 +3,9 @@
 #include "DolphinCardPath.hpp"
 
 #if WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <Windows.h>
-#include <winreg.h>
-#include <shlobj_core.h>
+#include "windows.h"
+#include "winreg.h"
+#include "shlobj_core.h"
 #endif
 
 #include <SDL3/SDL_filesystem.h>

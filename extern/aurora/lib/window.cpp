@@ -6,7 +6,6 @@
 #endif
 #include "input.hpp"
 #include "internal.hpp"
-#include "screenshot.hpp"
 
 #include <aurora/aurora.h>
 #include <aurora/event.h>
@@ -29,12 +28,8 @@ extern "C" void Android_UnlockActivityMutex(void);
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
-#include <chrono>
-#include <condition_variable>
-#include <deque>
-#include <mutex>
-#include <string>
 #include <vector>
 
 #include "rmlui.hpp"
@@ -51,45 +46,14 @@ float g_frameBufferScale = 0.f;
 bool g_frameBufferAspectFit = false;
 AuroraWindowSize g_windowSize;
 std::vector<AuroraEvent> g_events;
-std::deque<std::string> g_eventStrings;
 std::atomic_bool g_backgrounded = false;
 #if defined(SDL_PLATFORM_ANDROID)
 std::atomic_bool g_surfaceReady = false;
 #else
 std::atomic_bool g_surfaceReady = true;
 #endif
-// Set when the platform surface is destroyed. The swapchain still refers to the
-// old native window and must be rebuilt before it can be configured again.
-std::atomic_bool g_surfaceInvalidated = false;
-// Set while Android's surfaceChanged runs. The native window stays the same, so the
-// surface is kept: presenting pauses, and a refresh afterwards picks up the new size.
-std::atomic_bool g_surfaceChanging = false;
-std::mutex g_surfaceHeldMutex;
-std::condition_variable g_surfaceHeldCv;
-bool g_surfaceHeld = false;
 bool g_lastPaused = false;
 bool g_gotFocus = false;
-
-void retain_event_strings(SDL_Event& event) {
-  switch (event.type) {
-  case SDL_EVENT_DROP_BEGIN:
-  case SDL_EVENT_DROP_FILE:
-  case SDL_EVENT_DROP_TEXT:
-  case SDL_EVENT_DROP_COMPLETE:
-  case SDL_EVENT_DROP_POSITION:
-    break;
-  default:
-    return;
-  }
-  if (event.drop.source != nullptr) {
-    g_eventStrings.emplace_back(event.drop.source);
-    event.drop.source = g_eventStrings.back().c_str();
-  }
-  if (event.drop.data != nullptr) {
-    g_eventStrings.emplace_back(event.drop.data);
-    event.drop.data = g_eventStrings.back().c_str();
-  }
-}
 
 bool operator==(const AuroraWindowSize& lhs, const AuroraWindowSize& rhs) {
   return lhs.width == rhs.width && lhs.height == rhs.height && lhs.fb_width == rhs.fb_width &&
@@ -136,20 +100,6 @@ void resize_swapchain() noexcept {
     SDL_SetRenderScale(g_renderer, size.scale, size.scale);
   }
 #ifdef AURORA_ENABLE_GX
-  if (is_surface_changing()) {
-    return;
-  }
-  const bool invalidated = consume_surface_invalidated();
-  if (!is_presentable() || (invalidated && webgpu::surface_window_changed())) {
-    // The surface was destroyed since the swapchain was created, so configuring
-    // it would target a native window that no longer exists (and can take the
-    // whole device down). Drop it; the next frame rebuilds it against the new
-    // surface. This also matters when a blocking dialog outlives the surface.
-    // Android can also rebuild the surface onto the same window, and asking for
-    // a second surface for one window fails, so only rebuild when it moved.
-    webgpu::release_surface();
-    return;
-  }
   webgpu::resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height);
 #endif
 }
@@ -216,11 +166,6 @@ void process_event(SDL_Event& event) {
   }
 
   switch (event.type) {
-  case SDL_EVENT_KEY_DOWN:
-    if (primaryWindow && !event.key.repeat && event.key.scancode == SDL_SCANCODE_F12) {
-      request_screenshot();
-    }
-    break;
   case SDL_EVENT_WINDOW_MOVED: {
     if (!primaryWindow) {
       break;
@@ -269,6 +214,30 @@ void process_event(SDL_Event& event) {
     });
     break;
   }
+  case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
+    auto* ctrl = SDL_GetGamepadFromID(event.gbutton.which);
+    if (ctrl != nullptr) {
+      const bool backPressed = SDL_GetGamepadButton(ctrl, SDL_GAMEPAD_BUTTON_BACK);
+      const bool startPressed = SDL_GetGamepadButton(ctrl, SDL_GAMEPAD_BUTTON_START);
+      const bool guidePressed = SDL_GetGamepadButton(ctrl, SDL_GAMEPAD_BUTTON_GUIDE);
+      if (guidePressed || (backPressed && startPressed)) {
+        Log.info("Exit combo (Select + Start) triggered from gamepad");
+        g_events.push_back(AuroraEvent{
+            .type = AURORA_EXIT,
+        });
+      }
+    }
+    break;
+  }
+  case SDL_EVENT_KEY_DOWN: {
+    if (event.key.scancode == SDL_SCANCODE_ESCAPE) {
+      Log.info("Exit hotkey (Escape) triggered from keyboard");
+      g_events.push_back(AuroraEvent{
+          .type = AURORA_EXIT,
+      });
+    }
+    break;
+  }
   case SDL_EVENT_MOUSE_WHEEL:
     if (primaryWindow) {
       input::set_mouse_scroll(event.wheel.x, event.wheel.y);
@@ -306,7 +275,6 @@ void process_event(SDL_Event& event) {
   if (primaryWindow) {
     sync_paused();
   }
-  retain_event_strings(event);
   g_events.push_back(AuroraEvent{
       .type = AURORA_SDL_EVENT,
       .sdl = event,
@@ -317,17 +285,16 @@ void process_event(SDL_Event& event) {
 const AuroraEvent* poll_events() {
   ZoneScoped;
   g_events.clear();
-  g_eventStrings.clear();
 
   SDL_Event event;
   // Clear out the previous scroll values to prevent ghost input
   input::set_mouse_scroll(0, 0);
   if (is_paused()) {
-    // The application may service main-thread audio and I/O completions even
-    // while it cannot render. Do not block its pump until the window returns.
-    ZoneScopedN("SDL_WaitEventTimeout (paused)");
-    if (SDL_WaitEventTimeout(&event, 5)) {
+    ZoneScopedN("SDL_WaitEvent (paused)");
+    if (SDL_WaitEvent(&event)) {
       process_event(event);
+    } else {
+      Log.warn("SDL_WaitEvent failed: {}", SDL_GetError());
     }
   }
   while (true) {
@@ -349,13 +316,49 @@ const AuroraEvent* poll_events() {
 }
 
 bool create_window(AuroraBackend backend) {
-  SDL_WindowFlags flags = SDL_WINDOW_HIGH_PIXEL_DENSITY;
+  // The SDL2 shim is our custom SDL3 video driver wrapping the device's firmware SDL2 (kmsdrm/gbm via
+  // libMali). On that driver we let SDL create/own the GL context so it exposes the firmware's borrowed
+  // EGL display/surface/context, which Dawn then binds to via the adapter proc loader. On desktop
+  // (wayland/x11) Dawn owns EGL itself, so an SDL-owned context would make Dawn's worker-thread
+  // eglMakeCurrent fail with EGL_BAD_ACCESS — keep upstream's no-GL-flag behaviour there.
+  const char* videoDriver = SDL_GetCurrentVideoDriver();
+  const bool sdl2ShimDriver = videoDriver != nullptr && SDL_strcmp(videoDriver, "sdl2") == 0;
+
+  // The shim exists to lend Dawn the firmware's EGL/GLES display; no other backend can present
+  // through it. On a fresh config (backend "auto") the backend loop would otherwise attempt
+  // Vulkan first, and that attempt's window create/destroy cycle leaves the firmware SDL2/EGL
+  // stack unable to keep a context current for the later GLES attempt's EFB present init
+  // (fresh-install crash in the field). Refuse non-GLES backends before touching the display so
+  // the loop falls straight through to OpenGLES. BACKEND_NULL stays allowed: it is the loop's
+  // final fallback and must reach webgpu::initialize to produce the loud EFB-or-bust fatal.
+  if (sdl2ShimDriver && backend != BACKEND_OPENGLES && backend != BACKEND_NULL) {
+    constexpr std::array kBackendNames{"Auto",     "D3D11",  "D3D12",  "Metal", "Vulkan",
+                                       "OpenGL", "OpenGLES", "WebGPU", "Null"};
+    const auto idx = static_cast<size_t>(backend);
+    Log.info("Skipping backend {} on the sdl2 shim driver (GLES-only display path)",
+             idx < kBackendNames.size() ? kBackendNames[idx] : "?");
+    return false;
+  }
+
+  SDL_WindowFlags flags = 0;
+  // The borrowed-EGL path presents at the shim's own drawable size; high-DPI scaling here would desync
+  // the WebGPU swapchain extent from the borrowed surface. Skip it on the shim driver only.
+  if (!sdl2ShimDriver) {
+    flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
+  }
 #if TARGET_OS_IOS || TARGET_OS_TV
   flags |= SDL_WINDOW_FULLSCREEN;
 #else
   flags |= SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE;
   if (g_config.startFullscreen) {
     flags |= SDL_WINDOW_FULLSCREEN;
+  }
+#endif
+#ifdef AURORA_ENABLE_GX
+  // The GL backend renders through a real SDL GL context (desktop: SDL_GL_CreateContext;
+  // device: the shim's borrowed EGL context), so the window must be an OpenGL window.
+  if (backend == BACKEND_OPENGL || backend == BACKEND_OPENGLES) {
+    flags |= SDL_WINDOW_OPENGL;
   }
 #endif
   auto width = static_cast<Sint32>(g_config.windowWidth);
@@ -370,14 +373,24 @@ bool create_window(AuroraBackend backend) {
   if (height < 480) {
     height = 480;
   }
-  // Shrink a default that doesn't fit the desktop, keeping its aspect ratio.
-  SDL_Rect usable{};
-  if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable) && usable.w > 0 && usable.h > 0) {
-    const float fit = std::min(static_cast<float>(usable.w) / static_cast<float>(width),
-                               static_cast<float>(usable.h) / static_cast<float>(height));
-    if (fit < 1.f) {
-      width = std::max(640, static_cast<Sint32>(static_cast<float>(width) * fit));
-      height = std::max(480, static_cast<Sint32>(static_cast<float>(height) * fit));
+
+  // Device (sdl2 shim) path: the firmware SDL2 creates its fbdev surface at exactly the size we
+  // request and there is no compositor to place or scale it, so a window that is not the panel size
+  // shows up clipped and offset -- and SDL_WINDOW_FULLSCREEN is a no-op through the shim, so it
+  // cannot fix that. Size the window to the panel's native mode (the shim republishes the firmware
+  // SDL2 desktop mode as this SDL3 display), which makes every handheld fill its own panel with no
+  // per-device window-size config. Desktop keeps the configured/default size. The min-size clamp
+  // above stays as the floor for the pathological "mode query failed" case.
+  if (sdl2ShimDriver) {
+    const SDL_DisplayID display = SDL_GetPrimaryDisplay();
+    const SDL_DisplayMode* mode = display != 0 ? SDL_GetDesktopDisplayMode(display) : nullptr;
+    if (mode != nullptr && mode->w > 0 && mode->h > 0) {
+      width = mode->w;
+      height = mode->h;
+      Log.info("Device panel mode is {}x{}; sizing the window to fill it", width, height);
+    } else {
+      Log.warn("Could not query the device panel mode ({}); leaving window at {}x{}",
+               SDL_GetError(), width, height);
     }
   }
 
@@ -401,7 +414,16 @@ bool create_window(AuroraBackend backend) {
       SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, SDL_GetError());
   TRY(SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, flags), "Failed to set {}: {}",
       SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, SDL_GetError());
-  TRY(SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, backend != BACKEND_NULL),
+  if (flags & SDL_WINDOW_OPENGL) {
+    TRY(SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_OPENGL_BOOLEAN, true),
+        "Failed to set {}: {}", SDL_PROP_WINDOW_CREATE_OPENGL_BOOLEAN, SDL_GetError());
+  }
+  // Only the shim (device) path supplies the GL context externally (the firmware
+  // EGL context aurora borrows). On desktop, SDL owns the GL context via
+  // SDL_GL_CreateContext, so the window must NOT be flagged external -- otherwise
+  // SDL skips GL setup and SDL_GL_CreateContext rejects the window.
+  const bool externalGraphicsContext = sdl2ShimDriver && backend != BACKEND_NULL;
+  TRY(SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, externalGraphicsContext),
       "Failed to set {}: {}", SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, SDL_GetError());
   g_window = SDL_CreateWindowWithProperties(props);
   if (g_window == nullptr) {
@@ -497,9 +519,13 @@ AuroraWindowSize get_window_size() {
   int fb_w = native_fb_w;
   int fb_h = native_fb_h;
   if (g_frameBufferScale > 0.f) {
-    const auto [baseW, baseH] = vi::configured_fb_size();
+    // Scale the physical drawable, not the GameCube render mode, so the internal resolution is a
+    // fraction of the actual screen. An integer 1/N (e.g. 0.5) then maps each rendered pixel onto
+    // an exact NxN block of panel pixels -- pixel-perfect, no upscale shimmer -- on any display.
+    // (Passing the native size and its own aspect makes scale_frame_buffer_to_aspect a plain
+    // scale-by-g_frameBufferScale; the aspect-fit-to-game block below crops it to 4:3.)
     const auto [scaledW, scaledH] =
-        scale_frame_buffer_to_aspect(static_cast<int>(baseW), static_cast<int>(baseH), g_frameBufferScale,
+        scale_frame_buffer_to_aspect(fb_w, fb_h, g_frameBufferScale,
                                      static_cast<float>(fb_w) / static_cast<float>(fb_h));
     fb_w = scaledW;
     fb_h = scaledH;
@@ -528,20 +554,6 @@ AuroraWindowSize get_window_size() {
 
 SDL_Window* get_sdl_window() { return g_window; }
 
-const void* get_native_window_handle() noexcept {
-  if (g_window == nullptr) {
-    return nullptr;
-  }
-#if defined(SDL_PLATFORM_ANDROID)
-  // Changes when Android tears the SurfaceView's surface down and rebuilds it.
-  return SDL_GetPointerProperty(SDL_GetWindowProperties(g_window),
-                                SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr);
-#else
-  // The window itself is the identity everywhere else.
-  return g_window;
-#endif
-}
-
 SDL_Renderer* get_sdl_renderer() { return g_renderer; }
 
 bool is_paused() noexcept {
@@ -562,47 +574,12 @@ bool is_paused() noexcept {
 
 bool is_presentable() noexcept {
   return g_window != nullptr && !g_backgrounded.load(std::memory_order_acquire) &&
-         g_surfaceReady.load(std::memory_order_acquire) && !g_surfaceChanging.load(std::memory_order_acquire);
+         g_surfaceReady.load(std::memory_order_acquire);
 }
-
-bool is_surface_changing() noexcept { return g_surfaceChanging.load(std::memory_order_acquire); }
-
-void set_surface_changing(bool changing) noexcept {
-  g_surfaceChanging.store(changing, std::memory_order_release);
-  if (!changing && g_window != nullptr) {
-    push_custom_event(CustomEvent::RefreshSurface);
-  }
-}
-
-bool is_backgrounded() noexcept { return g_backgrounded.load(std::memory_order_acquire); }
-
-bool is_surface_ready() noexcept { return g_surfaceReady.load(std::memory_order_acquire); }
 
 void set_surface_ready(bool ready) noexcept {
-  const bool wasReady = g_surfaceReady.exchange(ready, std::memory_order_acq_rel);
+  g_surfaceReady.store(ready, std::memory_order_release);
   time::internal::set_pause_reason(time::internal::PauseReason::Surface, !ready);
-  if (wasReady && !ready) {
-    g_surfaceInvalidated.store(true, std::memory_order_release);
-  }
-}
-
-bool consume_surface_invalidated() noexcept {
-  return g_surfaceInvalidated.exchange(false, std::memory_order_acq_rel);
-}
-
-void set_surface_held(bool held) noexcept {
-  {
-    std::lock_guard lock{g_surfaceHeldMutex};
-    g_surfaceHeld = held;
-  }
-  if (!held) {
-    g_surfaceHeldCv.notify_all();
-  }
-}
-
-bool wait_surface_released(int timeoutMs) noexcept {
-  std::unique_lock lock{g_surfaceHeldMutex};
-  return g_surfaceHeldCv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [] { return !g_surfaceHeld; });
 }
 
 SurfaceLock::SurfaceLock() noexcept {
@@ -686,23 +663,5 @@ void set_background_input(bool value) { SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACK
 extern "C" JNIEXPORT void JNICALL Java_dev_encounter_aurora_AuroraSurface_nativeSetSurfaceReady(JNIEnv*, jclass,
                                                                                                 jboolean ready) {
   aurora::window::set_surface_ready(ready == JNI_TRUE);
-}
-
-extern "C" JNIEXPORT void JNICALL Java_dev_encounter_aurora_AuroraSurface_nativeSetSurfaceChanging(JNIEnv*, jclass,
-                                                                                                   jboolean changing) {
-  aurora::window::set_surface_changing(changing == JNI_TRUE);
-}
-
-// Called from surfaceDestroyed after the surface was marked not ready: the main
-// thread's next frame drops the swapchain. Presenting to a destroyed window can
-// lose the device on some drivers, and a lost device is fatal. The timeout keeps
-// a busy main thread (a long load) from turning this into an ANR.
-extern "C" JNIEXPORT jboolean JNICALL Java_dev_encounter_aurora_AuroraSurface_nativeWaitSurfaceReleased(JNIEnv*,
-                                                                                                       jclass) {
-  const bool released = aurora::window::wait_surface_released(2000);
-  if (!released) {
-    aurora::window::Log.warn("surfaceDestroyed: renderer still holds the surface after 2 s");
-  }
-  return released ? JNI_TRUE : JNI_FALSE;
 }
 #endif

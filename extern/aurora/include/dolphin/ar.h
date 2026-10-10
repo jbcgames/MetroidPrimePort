@@ -60,7 +60,6 @@ void* ARGetStorageAddress();
 
 // ARQ
 void ARQInit(void);
-void ARQPoll(void);
 void ARQReset(void);
 void ARQPostRequest(ARQRequest* request, u32 owner, u32 type, u32 priority, uintptr_t source, uintptr_t dest, u32 length, ARQCallback callback);
 void ARQRemoveRequest(ARQRequest* request);
@@ -69,6 +68,7 @@ void ARQFlushQueue(void);
 void ARQSetChunkSize(u32 size);
 u32 ARQGetChunkSize(void);
 BOOL ARQCheckInit(void);
+void ARQPoll(void);
 
 u16 __ARGetInterruptStatus(void);
 void __ARClearInterrupt(void);

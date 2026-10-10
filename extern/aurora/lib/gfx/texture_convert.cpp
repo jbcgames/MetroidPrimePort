@@ -2,7 +2,6 @@
 
 #include "../internal.hpp"
 #include "../gx/gx_fmt.hpp"
-#include "aurora/gfx.h"
 
 #include <algorithm>
 #include <array>
@@ -79,9 +78,9 @@ float avg_diff(const uint8_t* lhs, const uint8_t* rhs, uint32_t width, uint32_t 
  * difference between the original and downscaled mipmaps.
  */
 bool arb_mip_check(uint32_t width, uint32_t height, uint32_t mips, ArrayRef<uint8_t> data) {
-  if (mips < 2) {
-    return false;
-  }
+  // On low-power handhelds (Cortex-A35 / Mali), box-filtering and comparing pixel differences
+  // across all mip levels on the CPU causes multi-hundred millisecond hitches during texture loads.
+  return false;
 
   std::array<const uint8_t*, 10> levels{};
   std::array<uint32_t, 10> widths{};
@@ -584,19 +583,19 @@ ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, ui
           DecodeLinear<TextureDecoderI8>(static_cast<uint32_t>(ComputeMippedTexelCount(width, height, mips)), data);
       break;
     }
-    return {.format = to_wgpu(format), .width = width, .height = height, .mips = mips};
+    return {.format = to_gl(format), .width = width, .height = height, .mips = mips};
   case GX_TF_RG8_PC:
     if (!uses_direct_texture_upload(format)) {
       converted =
           DecodeLinear<TextureDecoderRG8>(static_cast<uint32_t>(ComputeMippedTexelCount(width, height, mips)), data);
       break;
     }
-    return {.format = to_wgpu(format), .width = width, .height = height, .mips = mips};
+    return {.format = to_gl(format), .width = width, .height = height, .mips = mips};
   case GX_TF_RGBA8_PC:
-    return {.format = to_wgpu(format), .width = width, .height = height, .mips = mips};
+    return {.format = to_gl(format), .width = width, .height = height, .mips = mips};
   case GX_TF_BC1_PC:
     if (uses_direct_texture_upload(format)) {
-      return {.format = to_wgpu(format), .width = width, .height = height, .mips = mips};
+      return {.format = to_gl(format), .width = width, .height = height, .mips = mips};
     }
     converted = BuildRGBA8FromBC1(width, height, mips, data);
     break;
@@ -634,13 +633,13 @@ ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, ui
     converted = BuildRGBA8FromCMPR(width, height, mips, data);
     break;
   }
-  const auto wgpuFormat = to_wgpu(format);
+  const auto glFormat = to_gl(format);
   bool hasArbitraryMips = false;
-  if (!is_pc_texture_format(format) && wgpuFormat == wgpu::TextureFormat::RGBA8Unorm && mips > 1) {
+  if (!is_pc_texture_format(format) && glFormat == gl::TextureFormat::RGBA8Unorm && mips > 1) {
     hasArbitraryMips = arb_mip_check(width, height, mips, converted);
   }
   return {
-      .format = wgpuFormat,
+      .format = glFormat,
       .width = width,
       .height = height,
       .mips = mips,
@@ -664,7 +663,7 @@ ConvertedTexture convert_tlut(u32 format, uint32_t width, ArrayRef<uint8_t> data
     break;
   }
   return {
-      .format = wgpu::TextureFormat::RGBA8Unorm,
+      .format = gl::TextureFormat::RGBA8Unorm,
       .width = width,
       .height = 1,
       .mips = 1,
@@ -722,7 +721,7 @@ ConvertedTexture convert_texture_palette(u32 textureFormat, uint32_t width, uint
 
   bool hasArbitraryMips = arb_mip_check(width, height, mips, pixels);
   return {
-      .format = wgpu::TextureFormat::RGBA8Unorm,
+      .format = gl::TextureFormat::RGBA8Unorm,
       .width = width,
       .height = height,
       .mips = mips,
@@ -731,27 +730,3 @@ ConvertedTexture convert_texture_palette(u32 textureFormat, uint32_t width, uint
   };
 }
 } // namespace aurora::gfx
-
-// Port: a bound GX texture object's base level as RGBA8 (w*h*4 bytes), for the Android touch
-// overlay's icons. Palette formats and PC compressed ones are not decoded (false).
-extern "C" bool aurora_gx_texobj_rgba8(const void* obj, uint32_t* width, uint32_t* height, uint8_t* out, size_t cap) {
-  using namespace aurora::gfx;
-  const auto* o = reinterpret_cast<const GXTexObj_*>(obj);
-  if (o == nullptr || o->data == nullptr || out == nullptr) {
-    return false;
-  }
-  const uint32_t w = o->width();
-  const uint32_t h = o->height();
-  const uint32_t fmt = o->format();
-  if (w == 0 || h == 0 || size_t(w) * h * 4 > cap || fmt == GX_TF_C4 || fmt == GX_TF_C8 || fmt == GX_TF_C14X2 || is_pc_texture_format(fmt)) {
-    return false;
-  }
-  ConvertedTexture px = convert_texture(fmt, w, h, 1, aurora::ArrayRef<uint8_t>{static_cast<const uint8_t*>(o->data), UINT32_MAX});
-  if (px.data.empty() || px.format != wgpu::TextureFormat::RGBA8Unorm || px.data.size() < size_t(w) * h * 4) {
-    return false;
-  }
-  std::memcpy(out, px.data.data(), size_t(w) * h * 4);
-  *width = w;
-  *height = h;
-  return true;
-}

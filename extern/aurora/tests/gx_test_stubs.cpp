@@ -1,25 +1,19 @@
 // Stub implementations for renderer symbols that the GX/FIFO/command_processor code
-// references but that live in the full renderer (gfx, gx.cpp, model/shader.cpp, etc.).
+// references but that live in the full renderer (common.cpp, gx.cpp, model/shader.cpp, etc.).
 // These allow the test binary to link without pulling in WebGPU runtime.
 
 #include "gx/gx.hpp"
-#include "gfx/bloom.hpp"
-#include "gfx/volfog.hpp"
-#include "gfx/shadow.hpp"
 #include "gfx/clear.hpp"
-#include "gfx/resources.hpp"
+#include "gfx/common.hpp"
 #include "gfx/depth_peek.hpp"
-#include "gfx/recording.hpp"
 #include "gfx/tex_copy_conv.hpp"
 #include "gfx/tex_palette_conv.hpp"
 #include "gfx/texture.hpp"
-#include "gfx/texture_replacement.hpp"
 #include "gx/pipeline.hpp"
 #include "gx/shader_info.hpp"
 #include "internal.hpp"
 #include "webgpu/gpu.hpp"
 
-#include <atomic>
 #include <cstdio>
 #include <fmt/format.h>
 
@@ -41,34 +35,24 @@ auto fmt::formatter<AuroraLogLevel>::format(AuroraLogLevel level, format_context
   return fmt::format_to(ctx.out(), "{}", static_cast<int>(level));
 }
 
-// --- GPU resources (default-constructed, not used in tests) ---
-namespace aurora::gfx::detail {
-Resources& resources() noexcept {
-  static Resources resources;
-  return resources;
-}
-
-void increment_merged_draw_count() noexcept {}
-} // namespace aurora::gfx::detail
+// --- GPU buffers (default-constructed, not used in tests) ---
+namespace aurora::gfx {
+AuroraStats g_stats;
+wgpu::Buffer g_vertexBuffer;
+wgpu::Buffer g_uniformBuffer;
+wgpu::Buffer g_indexBuffer;
+wgpu::Buffer g_storageBuffer;
+uint32_t g_drawCallCount = 0;
+uint32_t g_mergedDrawCallCount = 0;
+} // namespace aurora::gfx
 
 namespace aurora::webgpu {
 GraphicsConfig g_graphicsConfig{};
 } // namespace aurora::webgpu
 
-#include "webgpu/gpu_prof.hpp"
-namespace aurora::webgpu::gpu_prof {
-void set_enabled(bool) {}
-bool supported() { return false; }
-Result results() { return {}; }
-} // namespace aurora::webgpu::gpu_prof
-
-// --- GXState ---
+// --- GXState (the real instance -- tests validate this) ---
 namespace aurora::gx {
 GXState g_gxState{};
-static std::atomic<u16> sTestDrawSyncToken{0};
-void set_draw_sync_token(u16 token) noexcept { sTestDrawSyncToken.store(token, std::memory_order_release); }
-u16 draw_sync_token() noexcept { return sTestDrawSyncToken.load(std::memory_order_acquire); }
-void set_viewport_policy(AuroraViewportPolicy policy) noexcept {}
 } // namespace aurora::gx
 
 namespace aurora::vi {
@@ -79,10 +63,6 @@ void configure(const GXRenderModeObj*) noexcept {}
 // --- get_texture ---
 namespace aurora::gx {
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept { return g_gxState.textures[id]; }
-namespace texture {
-void invalidate_bindings() noexcept {}
-uint64_t current_bind_generation() noexcept { return 1; }
-} // namespace texture
 void evict_texture_object(u32 texObjId) noexcept {
   for (auto& obj : g_gxState.loadedTextures) {
     if (obj.texObjId == texObjId) {
@@ -107,7 +87,6 @@ void evict_copy_texture(const void* dest) noexcept {
     }
   }
 }
-void trim_copy_sizes(const void* dest, size_t keep) noexcept {}
 void shutdown() noexcept {}
 Vec2<uint32_t> logical_fb_size() noexcept { return {640, 480}; }
 gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcept { return logicalViewport; }
@@ -131,68 +110,27 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
 }
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept { return {}; }
 ShaderInfo build_shader_info(const ShaderConfig& config) noexcept { return {}; }
-gfx::Range build_uniform(const ShaderInfo& info) noexcept { return {.size = 1}; }
+gfx::Range build_uniform(const ShaderInfo& info, uint32_t vtxStart, const BindGroupRanges& ranges) noexcept {
+  return {};
+}
 void resolve_sampled_textures(const ShaderInfo& info) noexcept {}
-u32 dump_shaders(const char* dir) noexcept { return 0; }
-void set_shader_override_dir(const char* dir) noexcept {}
-void set_draw_shader_log(bool on) noexcept {}
-void note_draw_shader(u32 serial, const ShaderConfig& config) noexcept {}
-u64 draw_shader_hash(u32 serial) noexcept { return 0; }
-bool shader_overridden(u64 hash) noexcept { return false; }
+u8 color_channel(GXChannelID id) noexcept { return 0; }
 } // namespace aurora::gx
-namespace aurora::gfx {
-void drop_pipelines() {}
-} // namespace aurora::gfx
 
 // --- Buffer push stubs ---
 namespace aurora::gfx {
 Range push_verts(const uint8_t* data, size_t length, size_t alignment) { return {}; }
 Range push_indices(const uint8_t* data, size_t length, size_t alignment) { return {}; }
 Range push_uniform(const uint8_t* data, size_t length) { return {}; }
-// Tests set it to see draws dropped for want of storage room.
-bool g_testStorageFull = false;
-Range push_storage(const uint8_t* data, size_t length) { return g_testStorageFull ? OverflowRange : Range{}; }
-
-// The resident regions: tests set them, and see the uploads.
-Range g_testResidentRegions[3]{};
-uint32_t g_testResidentUploads = 0;
-Range resident_region(ResidentBuffer kind) noexcept { return g_testResidentRegions[static_cast<int>(kind)]; }
-bool queue_resident_upload(ResidentBuffer kind, uint32_t offset, const uint8_t* data, size_t size) {
-  ++g_testResidentUploads;
-  return true;
-}
+Range push_storage(const uint8_t* data, size_t length) { return {}; }
 
 Vec2<uint32_t> get_render_target_size() noexcept { return {640, 480}; }
 void set_viewport(const Viewport& viewport) noexcept {}
 void set_scissor(uint32_t x, uint32_t y, uint32_t w, uint32_t h) noexcept {}
-uint32_t get_sample_count() noexcept { return 1; }
-RenderTargetLayout get_render_target_layout() noexcept {
-  return {
-      .colorAttachmentCount = 1,
-      .colorAttachments = {{{ColorAttachmentSemantic::SceneColor, wgpu::TextureFormat::RGBA8Unorm}}},
-      .depthStencilFormat = wgpu::TextureFormat::Depth24Plus,
-      .sampleCount = 1,
-  };
-}
 } // namespace aurora::gfx
 
 // --- Pipeline/draw command stubs ---
 namespace aurora::gfx {
-namespace clear {
-PipelineConfig make_pipeline_config(const RenderTargetLayout& layout, bool clearColor, bool clearAlpha,
-                                    bool clearDepth) noexcept {
-  return {
-      .targetLayoutKey = layout.key,
-      .depthStencilFormat = layout.depthStencilFormat,
-      .colorAttachmentCount = layout.colorAttachmentCount,
-      .msaaSamples = layout.sampleCount,
-      .clearColor = clearColor,
-      .clearAlpha = clearAlpha,
-      .clearDepth = clearDepth,
-  };
-}
-} // namespace clear
-
 template <>
 PipelineRef pipeline_ref<clear::PipelineConfig>(const clear::PipelineConfig& config) {
   return 0;
@@ -207,13 +145,11 @@ PipelineRef pipeline_ref<gx::PipelineConfig>(const gx::PipelineConfig& config) {
 }
 gx::DrawData g_testLastDraw{};
 uint32_t g_testDrawCount = 0;
-std::atomic<uint32_t> g_testProcessedDrawCount{0};
 
 template <>
 void push_draw_command<gx::DrawData>(gx::DrawData data) {
   g_testLastDraw = data;
   ++g_testDrawCount;
-  g_testProcessedDrawCount.fetch_add(1, std::memory_order_release);
 }
 template <>
 gx::DrawData* get_last_draw_command() {
@@ -244,85 +180,13 @@ void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {}
 void queue_texture_upload(TextureUpload upload) {}
 void queue_texture_upload_data(const uint8_t* data, size_t length, uint32_t bytesPerRow, uint32_t rowsPerImage,
                                wgpu::TexelCopyTextureInfo tex, wgpu::Extent3D size) {}
-void queue_palette_conv(tex_palette_conv::ConvRequest req) {}
-namespace testing {
-std::atomic<uint32_t> beginOffscreenCount{0};
-std::atomic<uint32_t> endOffscreenCount{0};
-std::atomic<uint32_t> resolvePassCount{0};
-std::atomic<uint32_t> offscreenWidth{0};
-std::atomic<uint32_t> offscreenHeight{0};
-} // namespace testing
-
 void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
-                       Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat, int probeFace) {
-  testing::resolvePassCount.fetch_add(1, std::memory_order_release);
-}
-namespace probe {
-TextureHandle face(uint32_t face) { return {}; }
-void create_cube(uint32_t id, uint32_t size, uint32_t mipCount, const uint8_t* texels, size_t length) {}
-void destroy_cube(uint32_t id) {}
-bool has_cube(uint32_t id) { return false; }
-bool blend_cubes(uint32_t dst, const uint32_t* src, const float* weights, uint32_t count) { return false; }
-void create_volume(uint32_t id, uint32_t sizeX, uint32_t sizeY, uint32_t sizeZ, const uint8_t* texels, size_t length) {}
-void destroy_volume(uint32_t id) {}
-bool set_brdf_lut(const uint8_t* texels, size_t length) { return length == 256; }
-bool has_volume(uint32_t id) { return false; }
-bool lightmap_available() { return false; }
-bool lightmap_bc_supported() { return false; }
-void create_lightmap(uint32_t id, uint32_t width, uint32_t height, uint32_t layers, uint32_t format,
-                     const uint8_t* texels, size_t length) {}
-void destroy_lightmap(uint32_t id) {}
-bool has_lightmap(uint32_t id) { return false; }
-} // namespace probe
-void begin_offscreen(uint32_t width, uint32_t height) {
-  testing::offscreenWidth.store(width, std::memory_order_relaxed);
-  testing::offscreenHeight.store(height, std::memory_order_relaxed);
-  testing::beginOffscreenCount.fetch_add(1, std::memory_order_release);
-}
-void end_offscreen() { testing::endOffscreenCount.fetch_add(1, std::memory_order_release); }
+                       Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat) {}
+void queue_palette_conv(tex_palette_conv::ConvRequest req) {}
+void begin_offscreen(uint32_t width, uint32_t height) {}
+void end_offscreen() {}
 bool is_offscreen() noexcept { return false; }
 } // namespace aurora::gfx
-
-namespace aurora::gfx::bloom {
-bool push(const Params& params) { return false; }
-bool ensure_task() { return false; }
-void record(const Params& params) {}
-void set_grade_lut(uint32_t id, const uint8_t* rgba) {}
-void after_submit() noexcept {}
-bool frame_radiance(float out[3], uint32_t& serial) { return false; }
-void shutdown() {}
-} // namespace aurora::gfx::bloom
-
-namespace aurora::gfx::volfog {
-bool ensure_task() { return false; }
-bool record(const Params& params) { return false; }
-void shutdown() {}
-} // namespace aurora::gfx::volfog
-
-namespace aurora::gfx::shadow {
-bool ensure_task() { return false; }
-bool set_frame(const float worldToView[3][4], const float sunDir[3], float radius, const float color[3],
-               Uniform& out) {
-  return false;
-}
-bool box_casts(const float worldToView[3][4], const float sunDir[3], float radius, const float min[3],
-               const float max[3]) {
-  return false;
-}
-void box_center(const float worldToView[3][4], float radius, float center[3]) {}
-uint32_t last_caster_count() { return 0; }
-void add_caster(const gx::DrawData& draw) {}
-bool record() { return false; }
-const wgpu::TextureView& map_view() {
-  static const wgpu::TextureView view;
-  return view;
-}
-const wgpu::Sampler& sampler() {
-  static const wgpu::Sampler sampler;
-  return sampler;
-}
-void shutdown() {}
-} // namespace aurora::gfx::shadow
 
 namespace aurora::gfx::depth_peek {
 namespace {
@@ -376,6 +240,7 @@ void queue(ConvRequest req) {}
 
 namespace aurora::gfx::texture_replacement {
 u32 compute_texture_upload_size(const GXTexObj_& obj) noexcept { return 0; }
+std::optional<TextureHandle> find_replacement(const GXTexObj_&) noexcept { return std::nullopt; }
 bool has_replacement(const GXTexObj_&) noexcept { return false; }
 bool has_replacement(const GXTexObj_&, const GXTlutObj_&) noexcept { return false; }
 } // namespace aurora::gfx::texture_replacement

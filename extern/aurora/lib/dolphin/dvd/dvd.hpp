@@ -27,6 +27,10 @@ struct FSTEntry {
   void* overlayData = nullptr;
   bool isOverlay = false;
   s32 origEntryNum = 0;
+
+  FSTEntry() = default;
+  FSTEntry(std::string name, bool isDir, FstIndex parent, u32 nextOrLength, void* overlayData = nullptr, bool isOverlay = false, s32 origEntryNum = 0)
+  : name(std::move(name)), isDir(isDir), parent(parent), nextOrLength(nextOrLength), overlayData(overlayData), isOverlay(isOverlay), origEntryNum(origEntryNum) {}
 };
 
 struct IterateNode {

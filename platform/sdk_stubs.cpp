@@ -243,3 +243,36 @@ extern "C" void OSFatal(GXColor fg, GXColor bg, const char* msg) {
 extern "C" float frsqrte(float x) {
     return 1.0f / std::sqrt(x);
 }
+
+
+
+// --- Memory Card stubs ------------------------------------------------------
+extern "C" void aurora_card_set_base_path(const char* path) {}
+extern "C" void aurora_card_raw_list(void) {}
+extern "C" void aurora_card_raw_extract(void) {}
+extern "C" void aurora_card_raw_delete(void) {}
+extern "C" void aurora_card_raw_insert(void) {}
+extern "C" int aurora_card_get_type(int slot) { return 0; }
+extern "C" const char* aurora_card_get_path(int slot) { return ""; }
+extern "C" void aurora_card_remount(int slot) {}
+
+// --- Aurora namespace stubs -------------------------------------------------
+namespace aurora {
+void request_screenshot() {}
+
+namespace gfx {
+namespace vfx {
+struct DrawDesc;
+struct Vertex;
+void draw_quads(const DrawDesc&, const Vertex*, unsigned int) {}
+void draw_triangles(const DrawDesc&, const Vertex*, unsigned int) {}
+} // namespace vfx
+
+namespace water {
+struct DrawDesc;
+struct Vertex;
+void draw(const DrawDesc&, const Vertex*, unsigned int, const unsigned int*, unsigned int) {}
+} // namespace water
+} // namespace gfx
+} // namespace aurora
+

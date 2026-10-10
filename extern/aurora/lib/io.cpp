@@ -256,7 +256,7 @@ AtomicFileWriter open_atomic_file(const std::filesystem::path& path, AtomicFileM
       return {};
     }
 
-    if (mode != AtomicFileMode::Truncate) {
+    if (mode == AtomicFileMode::Preserve) {
       std::error_code ec;
       const bool exists = std::filesystem::exists(path, ec);
       if (ec) {
@@ -266,7 +266,7 @@ AtomicFileWriter open_atomic_file(const std::filesystem::path& path, AtomicFileM
         SDL_SetError("Failed to inspect destination: %s", error.c_str());
         return {};
       }
-      if (exists || mode == AtomicFileMode::UpdateExisting) {
+      if (exists) {
         auto source = open_file(path, "rb");
         if (!source || !copy_stream(source.get(), stream.get()) || SDL_SeekIO(stream.get(), 0, SDL_IO_SEEK_SET) != 0) {
           const std::string error{SDL_GetError()};

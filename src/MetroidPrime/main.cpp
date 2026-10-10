@@ -432,11 +432,13 @@ CGameArchitectureSupport::CGameArchitectureSupport(COsContext& osContext)
 , x7c_tickClock()
 , x88_audioLoadStatus(kALS_Uninitialized)
 , xc8_infiniteLoopAlarmSet(false) {
-  CAudioSys::SysSetVolume(0x7F, 0, 0xFF);
-  CAudioSys::SetDefaultVolumeScale(0x75);
+  const int initSfx = PortDebug::HasSfxVolume() ? (PortDebug::SfxVolume() * 127 + 50) / 100 : 0x5a;
+  const int initMusic = PortDebug::HasMusicVolume() ? (PortDebug::MusicVolume() * 127 + 50) / 100 : 0x5a;
+  CAudioSys::SysSetVolume(initSfx, 0, 0xFF);
+  CAudioSys::SetDefaultVolumeScale(initSfx);
   CAudioSys::SetVolumeScale(CAudioSys::GetDefaultVolumeScale());
   CDSPStreamManager::Initialize();
-  CStreamAudioManager::SetMusicVolume(0x7F);
+  CStreamAudioManager::SetMusicVolume(initMusic);
   CAudioSys::TrkSetSampleRate(kTSR_One);
   gpMain->SetMaxSpeed(false);
   gpMain->ResetGameState();
@@ -576,6 +578,7 @@ bool CGameArchitectureSupport::LoadAudio() {
   if (!loaded) {
     return false;
   }
+  fprintf(stderr, "CGameArchitectureSupport::LoadAudio COMPLETE\n");
   CSfxManager::LoadTranslationTable(gpSimplePool,
                                     gpResourceFactory->GetResourceIdByName("sound_lookup"));
   x8c_pendingAudioGroups = rstl::vector< CToken >();

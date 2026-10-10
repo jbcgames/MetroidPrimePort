@@ -1,0 +1,37 @@
+{
+  "version": 4,
+  "name": "metroid_prime.zip",
+  "items": [
+    "Metroid Prime.sh",
+    "metroid_prime"
+  ],
+  "items_opt": [],
+  "attr": {
+    "title": "Metroid Prime",
+    "porter": [
+      "Community"
+    ],
+    "desc": "Metroid Prime native port for RK3326 / Mali-G31 with OpenGL ES 3.0",
+    "desc_md": null,
+    "inst": "Place your Metroid Prime disc image (.iso, .gcm, or .rvz) in the 'metroid_prime/' directory.",
+    "inst_md": null,
+    "genres": [
+      "action",
+      "adventure"
+    ],
+    "image": null,
+    "rtr": false,
+    "exp": true,
+    "runtime": [],
+    "store": [],
+    "availability": "paid",
+    "reqs": [
+      "arm64",
+      "gles3"
+    ],
+    "arch": [
+      "aarch64"
+    ],
+    "min_glibc": "2.31"
+  }
+}

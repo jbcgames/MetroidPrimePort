@@ -45,8 +45,13 @@ double remainder(double x, double y) { return x - nearbyint(x / y) * y; }
 // itself. And the wrapper stays hidden: exported, it interposes libm, and the
 // dynamic linker resolves the versioned reference right back to it.
 extern double glibc_hypot(double, double);
+#if defined(__x86_64__)
 __asm__(".symver glibc_hypot,hypot@GLIBC_2.2.5");
 __attribute__((visibility("hidden"))) double hypot(double x, double y) { return glibc_hypot(x, y); }
+#elif defined(__aarch64__)
+__asm__(".symver glibc_hypot,hypot@GLIBC_2.17");
+__attribute__((visibility("hidden"))) double hypot(double x, double y) { return glibc_hypot(x, y); }
+#endif
 
 // Pre-C23 parsing, referenced by its original name so this does not recurse
 // into the wrapper it is defining.

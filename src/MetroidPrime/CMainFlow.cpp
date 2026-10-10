@@ -73,6 +73,7 @@ static inline bool IsCreditsMode(CMain::ERestartMode m) {
 }
 
 void CMainFlow::SetGameState(EClientFlowStates state, CArchitectureQueue& queue) {
+  fprintf(stderr, "CMainFlow::SetGameState state=%d\n", static_cast<int>(state));
   x14_gameState = state;
   PortSaveState::SetInFrontEnd(state == kCFS_FrontEnd);
 

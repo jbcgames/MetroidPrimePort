@@ -417,12 +417,32 @@ void OnSignal(int signal, siginfo_t* info, void* context) {
       header.Add(" at address ").Hex(reinterpret_cast< uintptr_t >(info->si_addr));
     }
     Emit(header);
-    if (const uintptr_t pc = FaultAddress(context); pc != 0) {
-      Line at;
-      at.Add("port: at ");
-      Describe(at, pc);
-      Emit(at);
+    const uintptr_t pc = FaultAddress(context);
+    Line at;
+    at.Add("port: at ");
+    Describe(at, pc);
+    Emit(at);
+#if defined(__aarch64__)
+    const auto* user = static_cast< const ucontext_t* >(context);
+    Line lrLine;
+    lrLine.Add("port: lr ");
+    Describe(lrLine, static_cast< uintptr_t >(user->uc_mcontext.regs[30]));
+    Emit(lrLine);
+    Line spLine;
+    spLine.Add("port: sp ").Hex(static_cast< uintptr_t >(user->uc_mcontext.sp));
+    Emit(spLine);
+
+    uintptr_t curFp = static_cast< uintptr_t >(user->uc_mcontext.regs[29]);
+    for (int frame = 0; frame < 16 && curFp > 0x1000; ++frame) {
+      uintptr_t* fpPtr = reinterpret_cast< uintptr_t* >(curFp);
+      Line fpLine;
+      fpLine.Add("port: fp #").Dec(frame).Add(" ");
+      Describe(fpLine, fpPtr[1]);
+      Emit(fpLine);
+      if (fpPtr[0] <= curFp || fpPtr[0] > curFp + 0x100000) break;
+      curFp = fpPtr[0];
     }
+#endif
     Line build;
     Emit(build.Add("port: build ").Add(MP_BUILD_REVISION));
     // Starts in this handler; the frames after the signal frame are the crashed code.

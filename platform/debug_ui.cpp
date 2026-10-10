@@ -215,7 +215,11 @@ float sSpringFlickRate = 6.f;
 float sStickAimRate = 900.f;
 float sFirstPersonFov = PortDebug::kFovRetail;
 int sMsaa = 1;
+#if defined(__arm__) || defined(__aarch64__)
+int sAnisotropy = 1;
+#else
 int sAnisotropy = 16;
+#endif
 // Setting `opengles`; sOpenGlesAtStart is what this run was started with.
 bool sOpenGles = false;
 bool sOpenGlesAtStart = false;
@@ -435,6 +439,10 @@ bool sSpringFlickArmed = true;
 bool sGyroOverride = false;
 float sGyroOverridePitch = 0.f;
 float sGyroOverrideYaw = 0.f;
+static int sSfxVolume = 70;
+static int sMusicVolume = 70;
+static bool sHasSfxVolume = false;
+static bool sHasMusicVolume = false;
 bool sVisible = false;
 bool sSettingsDirty = false;
 bool sAudioSettingsApplied = false;
@@ -533,6 +541,12 @@ void ApplySetting(const std::string& key, const std::string& value) {
                                                                   : 0;
   } else if (key == "ui_sounds") {
     sUiSounds = ParseBool(value);
+  } else if (key == "sfx_volume") {
+    sSfxVolume = std::clamp(std::atoi(value.c_str()), 0, 100);
+    sHasSfxVolume = true;
+  } else if (key == "music_volume") {
+    sMusicVolume = std::clamp(std::atoi(value.c_str()), 0, 100);
+    sHasMusicVolume = true;
   } else if (key == "disc_path") {
     sDiscPath = value;
   } else if (key == "remastered_nsp") {
@@ -1010,6 +1024,12 @@ void SaveSettings() {
   }
   file << "ai_audio=" << (sAiAudioEnabled ? 1 : 0) << '\n';
   file << "musyx_audio=" << (sMusyxAudioEnabled ? 1 : 0) << '\n';
+  if (sHasSfxVolume) {
+    file << "sfx_volume=" << sSfxVolume << '\n';
+  }
+  if (sHasMusicVolume) {
+    file << "music_volume=" << sMusicVolume << '\n';
+  }
   unsigned muted[64];
   const int mutedCount = MusyxPortGetMutedSamples(muted, 64);
   if (mutedCount > 0) {
@@ -7600,19 +7620,28 @@ void DrawSaveStatesTab() {
 void DrawGameAudio() {
   ImGui::SeparatorText("Audio");
   ImGui::BeginDisabled(gpGameState == nullptr);
-  int music = gpGameState != nullptr ? gpGameState->GameOptions().GetMusicVolume() : 0;
+  int music = gpGameState != nullptr ? gpGameState->GameOptions().GetMusicVolume() : (sMusicVolume * 127 + 50) / 100;
   int musicPct = (music * 100 + 63) / 127;
-  if (ImGui::SliderInt("Music volume", &musicPct, 0, 100, "%d%%") && gpGameState != nullptr) {
-    gpGameState->GameOptions().SetMusicVolume((musicPct * 127 + 50) / 100, true);
+  if (ImGui::SliderInt("Music volume", &musicPct, 0, 100, "%d%%")) {
+    sMusicVolume = musicPct;
+    sHasMusicVolume = true;
+    MarkDirty();
+    if (gpGameState != nullptr) {
+      gpGameState->GameOptions().SetMusicVolume((musicPct * 127 + 50) / 100, true);
+    }
   }
-  int sfx = gpGameState != nullptr ? gpGameState->GameOptions().GetSfxVolume() : 0;
+  int sfx = gpGameState != nullptr ? gpGameState->GameOptions().GetSfxVolume() : (sSfxVolume * 127 + 50) / 100;
   int sfxPct = (sfx * 100 + 63) / 127;
-  if (ImGui::SliderInt("Sound effects volume", &sfxPct, 0, 100, "%d%%") && gpGameState != nullptr) {
-    gpGameState->GameOptions().SetSfxVolume((sfxPct * 127 + 50) / 100, true);
+  if (ImGui::SliderInt("Sound effects volume", &sfxPct, 0, 100, "%d%%")) {
+    sSfxVolume = sfxPct;
+    sHasSfxVolume = true;
+    MarkDirty();
+    if (gpGameState != nullptr) {
+      gpGameState->GameOptions().SetSfxVolume((sfxPct * 127 + 50) / 100, true);
+    }
   }
   ImGui::EndDisabled();
-  ImGui::SetItemTooltip("The pause menu's volume options. Like them, they are stored in the save\n"
-                        "file the next time you save, and loading a save restores its volumes.");
+  ImGui::SetItemTooltip("The pause menu's volume options. Saved in port_settings.ini and save files.");
 }
 
 void DrawOriginalSection() {
@@ -8502,6 +8531,21 @@ const char* DiscPath() {
 
 void SetDiscPath(const char* path) {
   sDiscPath = path != nullptr ? path : "";
+  sSettingsDirty = true;
+}
+
+int SfxVolume() { return sSfxVolume; }
+int MusicVolume() { return sMusicVolume; }
+bool HasSfxVolume() { return sHasSfxVolume; }
+bool HasMusicVolume() { return sHasMusicVolume; }
+void SetSfxVolume(int pct) {
+  sSfxVolume = std::clamp(pct, 0, 100);
+  sHasSfxVolume = true;
+  sSettingsDirty = true;
+}
+void SetMusicVolume(int pct) {
+  sMusicVolume = std::clamp(pct, 0, 100);
+  sHasMusicVolume = true;
   sSettingsDirty = true;
 }
 

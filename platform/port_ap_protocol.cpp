@@ -876,7 +876,7 @@ Session::DataPackageNames Session::ParseDataPackage(const PortJson::Value& packe
       // Made even when the package has no tables: the game's names have been
       // asked for, and Connected does not ask again.
       GameNames& names = result[game];
-      const auto invert = [&package](const char* field, std::map< int64_t, std::string >& out) {
+      const auto invert = [&package = package](const char* field, std::map< int64_t, std::string >& out) {
         const PortJson::Value* table = Member(package, field);
         if (table == nullptr || !table->IsObject())
           return;

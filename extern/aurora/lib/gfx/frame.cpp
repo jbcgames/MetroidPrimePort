@@ -2,12 +2,6 @@
 
 #include "depth_peek.hpp"
 #include "pipeline_cache.hpp"
-#include "bloom.hpp"
-#include "shadow.hpp"
-#include "volfog.hpp"
-#include <aurora/vfx.hpp>
-#include <aurora/water.hpp>
-#include "probe.hpp"
 #include "recording.hpp"
 #include "render_worker.hpp"
 #include "resource_cache.hpp"
@@ -53,7 +47,6 @@ enum class BufferMapState {
   Mapped,
 };
 
-FrameBufferSizes g_bufferSizes;
 std::array<wgpu::Buffer, StagingBufferCount> g_stagingBuffers;
 std::array<std::atomic<BufferMapState>, StagingBufferCount> g_mappingStates;
 uint32_t g_frameIndex = UINT32_MAX;
@@ -228,7 +221,7 @@ void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion = false) {
   }
 
   g_stagingBuffers[slot].MapAsync(
-      wgpu::MapMode::Write, 0, g_bufferSizes.staging(), wgpu::CallbackMode::AllowSpontaneous,
+      wgpu::MapMode::Write, 0, StagingBufferSize, wgpu::CallbackMode::AllowSpontaneous,
       [slot, releaseSlotOnCompletion](wgpu::MapAsyncStatus status, wgpu::StringView message) {
         if (status == wgpu::MapAsyncStatus::CallbackCancelled || status == wgpu::MapAsyncStatus::Aborted) {
           Log.warn("Buffer mapping {}: {}", magic_enum::enum_name(status), message);
@@ -247,20 +240,6 @@ void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion = false) {
       });
 }
 } // namespace
-
-const FrameBufferSizes& frame_buffer_sizes() noexcept { return g_bufferSizes; }
-
-Range resident_region(ResidentBuffer kind) noexcept {
-  switch (kind) {
-  case ResidentBuffer::Vertex:
-    return {uint32_t(g_bufferSizes.vertex), uint32_t(g_bufferSizes.residentVertex)};
-  case ResidentBuffer::Index:
-    return {uint32_t(g_bufferSizes.index), uint32_t(g_bufferSizes.residentIndex)};
-  case ResidentBuffer::Storage:
-    return {uint32_t(g_bufferSizes.storage), uint32_t(g_bufferSizes.residentStorage)};
-  }
-  return {};
-}
 
 namespace detail {
 
@@ -419,49 +398,6 @@ void initialize() {
   // For uniform & storage buffer offset alignments
   g_device.GetLimits(&g_resources.limits);
 
-  // The vertex and array buffers are bound whole as storage, and one staging buffer holds
-  // a frame of everything, so the scale stops where the device does.
-  {
-    const uint64_t maxBinding = g_resources.limits.maxStorageBufferBindingSize;
-    const uint64_t maxBuffer = g_resources.limits.maxBufferSize;
-    uint32_t scale = std::max<uint32_t>(g_config.frameBufferScale, 1);
-    for (;; --scale) {
-      g_bufferSizes = {
-          .vertex = VertexBufferSize * scale,
-          .uniform = scale > 1 ? UniformBufferSize * 2 : UniformBufferSize,
-          // Not scaled: the heaviest room measured drew 0.1 MiB of indices, and each
-          // scaled MiB here costs one per staging buffer plus the device copy.
-          .index = IndexBufferSize,
-          .storage = StorageBufferSize * scale,
-      };
-      if (scale == 1 || (g_bufferSizes.vertex <= maxBinding && g_bufferSizes.storage <= maxBinding &&
-                         g_bufferSizes.staging() <= maxBuffer)) {
-        break;
-      }
-    }
-    if (scale != std::max<uint32_t>(g_config.frameBufferScale, 1)) {
-      Log.warn("Frame buffer scale {} is beyond this device, using {}", g_config.frameBufferScale, scale);
-    }
-    // The resident regions follow a frame's data in the device buffers, which are bound
-    // whole, so they take what the device leaves after it: two fifths each to vertices and
-    // arrays, a fifth to indices.
-    const uint64_t resident = uint64_t(g_config.residentGeometryMiB) * 1024 * 1024;
-    if (resident != 0) {
-      const auto fit = [](uint64_t want, uint64_t frame, uint64_t limit) -> uint64_t {
-        const uint64_t room = limit > frame ? limit - frame : 0;
-        // Offsets into it are u32, and every allocation is 256-aligned.
-        return std::min({want, room, uint64_t(UINT32_MAX) - frame}) & ~uint64_t(255);
-      };
-      const uint64_t bound = std::min(maxBinding, maxBuffer);
-      g_bufferSizes.residentVertex = fit(resident / 5 * 2, g_bufferSizes.vertex, bound);
-      g_bufferSizes.residentStorage = fit(resident / 5 * 2, g_bufferSizes.storage, bound);
-      g_bufferSizes.residentIndex = fit(resident / 5, g_bufferSizes.index, maxBuffer);
-      Log.info("Resident geometry: {} MiB of vertices, {} MiB of arrays, {} MiB of indices",
-               g_bufferSizes.residentVertex >> 20, g_bufferSizes.residentStorage >> 20,
-               g_bufferSizes.residentIndex >> 20);
-    }
-  }
-
   const auto createBuffer = [](wgpu::Buffer& out, wgpu::BufferUsage usage, uint64_t size, const char* label) {
     if (size <= 0) {
       return;
@@ -473,19 +409,18 @@ void initialize() {
     };
     out = g_device.CreateBuffer(&descriptor);
   };
-  createBuffer(g_resources.uniformBuffer, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst, g_bufferSizes.uniform,
+  createBuffer(g_resources.uniformBuffer, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst, UniformBufferSize,
                "Shared Uniform Buffer");
   createBuffer(g_resources.vertexBuffer,
-               wgpu::BufferUsage::Storage | wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst,
-               g_bufferSizes.vertex + g_bufferSizes.residentVertex, "Shared Vertex Buffer");
-  createBuffer(g_resources.indexBuffer, wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst,
-               g_bufferSizes.index + g_bufferSizes.residentIndex,
+               wgpu::BufferUsage::Storage | wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst, VertexBufferSize,
+               "Shared Vertex Buffer");
+  createBuffer(g_resources.indexBuffer, wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst, IndexBufferSize,
                "Shared Index Buffer");
-  createBuffer(g_resources.storageBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
-               g_bufferSizes.storage + g_bufferSizes.residentStorage, "Shared Storage Buffer");
+  createBuffer(g_resources.storageBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, StorageBufferSize,
+               "Shared Storage Buffer");
   for (size_t i = 0; i < g_stagingBuffers.size(); ++i) {
     const auto label = fmt::format("Staging Buffer {}", i);
-    createBuffer(g_stagingBuffers[i], wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc, g_bufferSizes.staging(),
+    createBuffer(g_stagingBuffers[i], wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc, StagingBufferSize,
                  label.c_str());
   }
   for (auto& state : g_mappingStates) {
@@ -598,12 +533,6 @@ void shutdown() {
   shutdown_pipeline_cache();
   depth_peek::shutdown();
   tex_copy_conv::shutdown();
-  probe::shutdown();
-  bloom::shutdown();
-  volfog::shutdown();
-  shadow::shutdown();
-  vfx::shutdown();
-  water::shutdown();
   tex_palette_conv::shutdown();
   texture_replacement::shutdown();
   gx::shutdown();
@@ -707,10 +636,10 @@ bool begin_frame() {
     buf = ByteBuffer{static_cast<u8*>(stagingBuf.GetMappedRange(bufferOffset, size)), static_cast<size_t>(size)};
     bufferOffset += size;
   };
-  mapBuffer(frame.verts, g_bufferSizes.vertex);
-  mapBuffer(frame.uniforms, g_bufferSizes.uniform);
-  mapBuffer(frame.indices, g_bufferSizes.index);
-  mapBuffer(frame.storage, g_bufferSizes.storage);
+  mapBuffer(frame.verts, VertexBufferSize);
+  mapBuffer(frame.uniforms, UniformBufferSize);
+  mapBuffer(frame.indices, IndexBufferSize);
+  mapBuffer(frame.storage, StorageBufferSize);
   if constexpr (UseTextureBuffer) {
     mapBuffer(frame.textureUpload, TextureUploadSize);
   }
@@ -752,7 +681,6 @@ void end_frame(EndFrameCallback callback) {
     packet = {};
     g_resources.stats.drawCallCount = stats.drawCallCount;
     g_resources.stats.mergedDrawCallCount = stats.mergedDrawCallCount;
-    g_resources.stats.renderPassCount = stats.renderPassCount;
     g_resources.stats.lastVertSize = stats.lastVertSize;
     g_resources.stats.lastUniformSize = stats.lastUniformSize;
     g_resources.stats.lastIndexSize = stats.lastIndexSize;
@@ -770,10 +698,7 @@ void end_frame(EndFrameCallback callback) {
 
 uint32_t current_frame() noexcept { return g_frameIndex; }
 
-void after_submit() noexcept {
-  depth_peek::after_submit();
-  bloom::after_submit();
-}
+void after_submit() noexcept { depth_peek::after_submit(); }
 
 void gpu_synchronize() { render_worker::synchronize(); }
 
@@ -810,16 +735,4 @@ float calculate_fps() noexcept {
 } // namespace aurora::gfx
 
 const AuroraStats* aurora_get_stats() { return &aurora::gfx::detail::resources().stats; }
-
-uint32_t aurora_get_frame_buffer_scale() {
-  return static_cast<uint32_t>(aurora::gfx::frame_buffer_sizes().vertex / aurora::gfx::VertexBufferSize);
-}
-uint32_t aurora_get_resident_geometry_mib() {
-  const auto& sizes = aurora::gfx::frame_buffer_sizes();
-  return static_cast<uint32_t>((sizes.residentVertex + sizes.residentIndex + sizes.residentStorage) >> 20);
-}
 float aurora_get_fps() { return aurora::gfx::calculate_fps(); }
-void aurora_get_texture_support(bool* bc, bool* astc) {
-  *bc = aurora::webgpu::g_bcTexturesSupported;
-  *astc = aurora::webgpu::g_astcTexturesSupported;
-}

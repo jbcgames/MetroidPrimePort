@@ -239,7 +239,7 @@ endif()
 # here (its own flags live elsewhere).
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     set_source_files_properties(${MP_PORT_SOURCES} platform/smoke.cpp PROPERTIES
-        COMPILE_OPTIONS "-Wall;-Wextra;-Wno-multichar;-Wno-unused-parameter;-Wno-ignored-qualifiers")
+        COMPILE_OPTIONS "-Wall;-Wextra;-Wno-multichar;-Wno-unused-parameter;-Wno-ignored-qualifiers;-include;${CMAKE_CURRENT_SOURCE_DIR}/platform/compat.h")
 endif()
 if(ANDROID)
     add_library(metroid_prime_port SHARED ${MP_PORT_SOURCES})

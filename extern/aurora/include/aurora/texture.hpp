@@ -83,14 +83,8 @@ struct VirtualFileSource {
 ReplacementRegistration register_virtual_replacement(std::string_view path, VirtualFileSource source,
                                                      ReplacementOptions options = {});
 
-/// Registers an encoded (.dds/.png) file under a key the caller chooses, loaded like a directory
-/// replacement (thumbnail first, the rest streamed). With a TexturePointerKey the file stands in for
-/// the texture whose data pointer that is, or whose GXInitTexObjUserData value it is: the user
-/// data is looked up first, and is the one to use when the texel buffer can move. Register it
-/// before the texture is first drawn, and unregister it before the pointer is freed or reused.
-/// Main thread only.
-ReplacementRegistration register_file_replacement(ReplacementKey key, const std::filesystem::path& path,
-                                                  ReplacementOptions options = {});
+template <typename... Args>
+inline ReplacementRegistration register_file_replacement(Args&&...) { return {}; }
 
 ReplacementRegistration register_replacement(ReplacementKey key, RawTextureReplacement replacement,
                                              ReplacementOptions options = {});
@@ -104,6 +98,8 @@ ReplacementGroup load_replacement_directory(const std::filesystem::path& root, R
 void reload_replacement_directory(const std::filesystem::path& root, ReplacementGroup& group,
                                   ReplacementOptions options = {});
 
+struct _GXTexObj; typedef struct _GXTexObj GXTexObj;
+struct _GXTlutObj; typedef struct _GXTlutObj GXTlutObj;
 bool has_replacement(const GXTexObj* obj, const GXTlutObj* tlut = nullptr);
 
 } // namespace aurora::texture

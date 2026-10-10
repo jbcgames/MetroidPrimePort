@@ -858,6 +858,7 @@ int main(int argc, char** argv) {
         }
     }
     PortCrash::Install();
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     PortLog::Write( "metroid_prime_port: version %s, build %s\n", MP_BUILD_VERSION, MP_BUILD_REVISION);
     for (const std::string& line : PortPaths::MigrationLog()) {
         PortLog::Write("port: portable data: %s\n", line.c_str());
@@ -1023,7 +1024,7 @@ int main(int argc, char** argv) {
         .imGuiInitCallback = nullptr,
         .mem1Size = mem1Size,
         .mem2Size = ARAM_DEFAULT_SIZE,
-        .frameBufferScale = frameBufferScale,
+        .frameBufferScale = static_cast<float>(frameBufferScale),
         .residentGeometryMiB = residentMiB,
         // An embedded seed wins over a stale initial_pipeline_cache.db beside the executable.
         .pipelineCacheSeedData = embeddedSeed.data(),

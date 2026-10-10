@@ -3,23 +3,25 @@ include(FetchContent)
 # Don't build tests for third party dependencies
 set(BUILD_TESTING OFF CACHE INTERNAL "Build tests")
 set(SKIP_INSTALL_ALL ON)
-if (WIN32 AND NOT DEFINED BUILD_SHARED_LIBS)
+if (NOT DEFINED BUILD_SHARED_LIBS)
   set(_USE_SHARED ON)
 else ()
   set(_USE_SHARED OFF)
 endif ()
 
 function(aurora_find_package_global)
-  find_package(${ARGV} GLOBAL)
+  set(_PREV_FIND_PACKAGE_TARGETS_GLOBAL ${CMAKE_FIND_PACKAGE_TARGETS_GLOBAL})
+  set(CMAKE_FIND_PACKAGE_TARGETS_GLOBAL ON)
+  find_package(${ARGV})
+  set(CMAKE_FIND_PACKAGE_TARGETS_GLOBAL ${_PREV_FIND_PACKAGE_TARGETS_GLOBAL})
 endfunction()
 
-if (AURORA_ENABLE_GX)
-  include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/AuroraDawnProvider.cmake)
-  set(AURORA_DAWN_IS_SHARED "${AURORA_DAWN_IS_SHARED}" PARENT_SCOPE)
-endif ()
+# Dawn removed: the hand-rolled GLES backend (lib/gl/) replaces it. The provider
+# (which fetched + built Dawn and vendored Abseil) is gone; Abseil is fetched
+# standalone below.
 
-# Abseil is needed for core libraries. It normally comes via Dawn's vendor build.
-# Otherwise prefer a system package and only fetch it as a last resort.
+# Abseil is needed for core libraries. It normally came via Dawn's vendor build;
+# now prefer a system package and fetch it standalone as a fallback.
 if (NOT TARGET absl::flat_hash_map OR NOT TARGET absl::btree)
   aurora_find_package_global(absl CONFIG QUIET GLOBAL)
 endif ()
@@ -47,10 +49,7 @@ endif ()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/AuroraSDL3Provider.cmake)
 
-if (NOT TARGET xxHash::xxhash)
-  aurora_find_package_global(xxHash)
-endif ()
-if (NOT TARGET xxHash::xxhash)
+if (NOT TARGET xxhash)
   message(STATUS "aurora: Fetching xxhash")
   FetchContent_Declare(xxhash
     URL https://github.com/Cyan4973/xxHash/archive/refs/tags/v0.8.3.tar.gz
@@ -84,7 +83,7 @@ if (NOT TARGET xxHash::xxhash)
   unset(_aurora_xxhash_had_bsl_cache)
   unset(_aurora_xxhash_had_bsl_var)
   unset(_aurora_xxhash_saved_bsl)
-  if (NOT TARGET xxHash::xxhash)
+  if (NOT TARGET xxhash)
     message(FATAL_ERROR "Failed to make xxhash available")
   endif ()
 else ()
@@ -113,15 +112,6 @@ endif ()
 if (AURORA_ENABLE_GX)
   if (NOT TARGET ZLIB::ZLIB)
     aurora_find_package_global(ZLIB QUIET)
-  endif ()
-  if (NOT TARGET ZLIB::ZLIB)
-    find_package(PkgConfig)
-    if (PkgConfig_FOUND AND NOT CMAKE_CROSSCOMPILING)
-      pkg_check_modules(zlib IMPORTED_TARGET GLOBAL zlib)
-      if (TARGET PkgConfig::zlib)
-        add_library(ZLIB::ZLIB ALIAS PkgConfig::zlib)
-      endif ()
-    endif ()
   endif ()
   if (NOT TARGET ZLIB::ZLIB)
     message(STATUS "aurora: Fetching zlib")
@@ -158,16 +148,6 @@ if (AURORA_ENABLE_GX)
       add_library(PNG::PNG ALIAS png_static)
     else ()
       aurora_find_package_global(PNG QUIET)
-      if (NOT TARGET PNG::PNG)
-        find_package(PkgConfig)
-        if (PkgConfig_FOUND AND NOT CMAKE_CROSSCOMPILING)
-          pkg_check_modules(libpng IMPORTED_TARGET GLOBAL libpng)
-          if (TARGET PkgConfig::libpng)
-            target_link_libraries(PkgConfig::libpng INTERFACE ZLIB::ZLIB)
-            add_library(PNG::PNG ALIAS PkgConfig::libpng)
-          endif ()
-        endif ()
-      endif ()
     endif ()
   endif ()
   if (NOT TARGET PNG::PNG)
@@ -195,15 +175,6 @@ if (AURORA_ENABLE_GX)
   endif ()
 
   aurora_find_package_global(Freetype QUIET)
-  if (NOT TARGET Freetype::Freetype)
-    find_package(PkgConfig)
-    if (PkgConfig_FOUND AND NOT CMAKE_CROSSCOMPILING)
-      pkg_check_modules(freetype2 IMPORTED_TARGET GLOBAL freetype2)
-      if (TARGET PkgConfig::freetype2)
-        add_library(Freetype::Freetype ALIAS PkgConfig::freetype2)
-      endif ()
-    endif ()
-  endif ()
   if (NOT TARGET Freetype::Freetype)
     message(STATUS "aurora: Fetching Freetype")
     set(FT_DISABLE_BROTLI ON CACHE BOOL "" FORCE)
@@ -241,13 +212,27 @@ if (AURORA_ENABLE_GX)
     )
     target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR})
 
+    # The Dawn WebGPU imgui backend is gone; the GLES backend renders via
+    # imgui_impl_opengl3 ("#version 300 es"). imgui_impl_sdl3 is the platform backend
+    # (input/timing); imgui_impl_sdlrenderer3 stays for the headless/NULL backend.
     add_library(imgui_backends STATIC
       ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
       ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp
-      ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp
+      ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
     )
-    target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
-    target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET} dawn::webgpu_dawn)
+    # imgui_impl_opengl3 renders on our GLES 3.0 context. Without IMGUI_IMPL_OPENGL_ES3 it
+    # compiles the desktop-GL path, whose embedded gl3w loader dlopen()s libGL.so -- absent on
+    # Mali/PowerVR (loader init fails -> "Failed to initialize OpenGL loader!" -> NewFrame
+    # null-derefs, the device crash). ES3 makes it #include <GLES3/gl3.h> and call GLES entry
+    # points directly (only core ES3 calls; the desktop-only glPolygonMode/DrawElementsBaseVertex/
+    # ClipControl are #if-gated out), resolved from libGLESv2 -- libmali on device, Mesa on the
+    # dev box. Linking libGLESv2 is exactly what every normal SDL+GLES app does (Normalcy rule 7).
+    target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_OPENGL_ES3)
+    find_library(AURORA_GLESV2_LIB GLESv2)
+    if (NOT AURORA_GLESV2_LIB)
+      set(AURORA_GLESV2_LIB GLESv2) # fall back to the linker's own -lGLESv2 search
+    endif ()
+    target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET} ${AURORA_GLESV2_LIB})
     target_link_libraries(imgui PUBLIC imgui_backends)
 
     if (TARGET Freetype::Freetype)
@@ -274,16 +259,6 @@ if (AURORA_ENABLE_GX)
     message(STATUS "aurora: Using existing sqlite3")
     add_library(sqlite3 ALIAS SQLite::SQLite3)
   else ()
-    find_package(PkgConfig)
-    if (PkgConfig_FOUND AND NOT CMAKE_CROSSCOMPILING)
-      pkg_check_modules(sqlite3 IMPORTED_TARGET GLOBAL sqlite3)
-      if (TARGET PkgConfig::sqlite3)
-        add_library(sqlite3 ALIAS PkgConfig::sqlite3)
-      endif ()
-    endif ()
-  endif ()
-
-  if (NOT TARGET sqlite3)
     message(STATUS "aurora: Fetching sqlite3")
     FetchContent_Declare(sqlite3
       URL https://sqlite.org/2026/sqlite-amalgamation-3510300.zip
@@ -301,7 +276,7 @@ if (AURORA_ENABLE_GX)
     aurora_find_package_global(zstd CONFIG QUIET)
     if (NOT TARGET zstd::libzstd)
       find_package(PkgConfig QUIET)
-      if(PkgConfig_FOUND AND NOT CMAKE_CROSSCOMPILING)
+      if(PkgConfig_FOUND)
         pkg_check_modules(ZSTD libzstd IMPORTED_TARGET GLOBAL)
         if(ZSTD_FOUND)
           add_library(zstd::libzstd ALIAS PkgConfig::ZSTD)
@@ -351,10 +326,7 @@ if (AURORA_ENABLE_GX)
   endif ()
 endif ()
 
-if (NOT TARGET Tracy::TracyClient)
-  aurora_find_package_global(Tracy CONFIG)
-endif ()
-if (NOT TARGET Tracy::TracyClient)
+if (NOT TARGET TracyClient)
   message(STATUS "aurora: Fetching Tracy")
 
   # Default to off, users can enable the cache variable if they want to use it.
@@ -364,8 +336,8 @@ if (NOT TARGET Tracy::TracyClient)
 
   FetchContent_Declare(
           tracy
-          URL https://github.com/wolfpld/tracy/archive/refs/tags/v0.14.1.zip
-          URL_HASH SHA256=908f3a2917fa86a247abfcf85dcf04bad1db6986a4d40f94b70512f3e9e98d5b
+          URL https://github.com/wolfpld/tracy/archive/6789e7d6f9a65ec98926b602097a33a9676d2606.tar.gz
+          URL_HASH SHA256=ebfe4fb50d7c254901979355c80a7d4cd33624aa2ec0fe90b3b238153cd5d69b
           DOWNLOAD_EXTRACT_TIMESTAMP FALSE
           EXCLUDE_FROM_ALL
   )

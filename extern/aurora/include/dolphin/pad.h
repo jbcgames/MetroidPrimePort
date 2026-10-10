@@ -88,9 +88,6 @@ extern "C" {
 #endif
 
 #define PAD_NATIVE_BUTTON_INVALID 0xFFFFFFFF
-/* An analog trigger as a button mapping's native button: pressed past half travel. */
-#define PAD_NATIVE_BUTTON_TRIGGER_LEFT 0x1000
-#define PAD_NATIVE_BUTTON_TRIGGER_RIGHT 0x1001
 
 typedef struct PADStatus {
   u16 button;
@@ -196,20 +193,31 @@ void PADSetAllAxisMappings(u32 port, PADAxisMapping axes[PAD_AXIS_COUNT]);
 PADAxisMapping* PADGetAxisMappings(u32 port, u32* axisCount);
 void PADSerializeMappings();
 
+#define PAD_NATIVE_BUTTON_TRIGGER_LEFT 1000
+#define PAD_NATIVE_BUTTON_TRIGGER_RIGHT 1001
+#define PAD_KEY_SLOT_COUNT 4
+
 BOOL PADSetKeyButtonBinding(u32 port, PADKeyButtonBinding binding);
 BOOL PADSetKeyButtonBindings(u32 port, PADKeyButtonBinding bindings[PAD_BUTTON_COUNT]);
 PADKeyButtonBinding* PADGetKeyButtonBindings(u32 port, u32* buttonCount);
 BOOL PADSetKeyAxisBinding(u32 port, PADKeyAxisBinding binding);
 BOOL PADSetKeyAxisBindings(u32 port, PADKeyAxisBinding bindings[PAD_BUTTON_COUNT]);
 PADKeyAxisBinding* PADGetKeyAxisBindings(u32 port, u32* axisCount);
-/* Each pad input takes up to PAD_KEY_SLOT_COUNT keys; the calls above use slot 0. */
-#define PAD_KEY_SLOT_COUNT 2
-BOOL PADSetKeyButtonBindingSlot(u32 port, u32 slot, PADKeyButtonBinding binding);
-PADKeyButtonBinding* PADGetKeyButtonBindingsSlot(u32 port, u32 slot, u32* buttonCount);
-BOOL PADSetKeyAxisBindingSlot(u32 port, u32 slot, PADKeyAxisBinding binding);
-PADKeyAxisBinding* PADGetKeyAxisBindingsSlot(u32 port, u32 slot, u32* axisCount);
 void PADClearKeyBindings(u32 port);
 void PADSetKeyboardActive(u32 port, BOOL active);
+
+inline BOOL PADSetKeyButtonBindingSlot(u32 port, u32 slot, PADKeyButtonBinding binding) {
+  return PADSetKeyButtonBinding(port, binding);
+}
+inline BOOL PADSetKeyAxisBindingSlot(u32 port, u32 slot, PADKeyAxisBinding binding) {
+  return PADSetKeyAxisBinding(port, binding);
+}
+inline PADKeyButtonBinding* PADGetKeyButtonBindingsSlot(u32 port, u32 slot, u32* count) {
+  return PADGetKeyButtonBindings(port, count);
+}
+inline PADKeyAxisBinding* PADGetKeyAxisBindingsSlot(u32 port, u32 slot, u32* count) {
+  return PADGetKeyAxisBindings(port, count);
+}
 
 PADDeadZones* PADGetDeadZones(u32 port);
 const char* PADGetButtonName(PADButton);

@@ -14,6 +14,10 @@ struct OverlayFileEntry {
   u32 size;
   s32 entryNum = k_invalidFstEntry;
   size_t sourceIndex = 0;
+
+  OverlayFileEntry() = default;
+  OverlayFileEntry(std::string fileName, void* userData, u32 size, s32 entryNum = k_invalidFstEntry, size_t sourceIndex = 0)
+  : fileName(std::move(fileName)), userData(userData), size(size), entryNum(entryNum), sourceIndex(sourceIndex) {}
 };
 
 std::vector<OverlayFileEntry> s_overlayFiles;
@@ -112,7 +116,7 @@ void mergeOverlayFileIntoContext(const IterateContext& context, OverlayFileEntry
   std::string_view filePath = overlayFile.fileName;
   std::string currentPath;
 
-  assert(filePath.starts_with('/'));
+  assert(filePath.rfind('/', 0) == 0);
   filePath = filePath.substr(1);
   while (true) {
     const auto nextDelim = filePath.find('/');
@@ -227,7 +231,7 @@ s32 calcEntryCount(const IterateNode& node) {
 bool validateOverlayFile(const AuroraOverlayFile& file) {
   const std::string_view name(file.fileName);
 
-  if (!name.starts_with('/')) {
+  if (name.rfind('/', 0) != 0) {
     Log.error("Overlay path {} does not start with /", name);
     return false;
   }
